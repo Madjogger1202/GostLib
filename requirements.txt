@@ -1,0 +1,2 @@
+PySide6>=6.5
+olefile>=0.46
