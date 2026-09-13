@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 def default_root() -> str:
@@ -39,6 +39,7 @@ class Config:
     show_power_marks: bool = True
     ic_fields: bool = True
     group_gap_rows: int = 1
+    compact_symbols: bool = True  # одинаковые узкие боковые поля по сетке
     # масштаб графики двухвыводных элементов (резистор, конденсатор, диод…)
     passive_scale: float = 1.0
     # цвета Altium: целое BGR, 0 = чёрный
@@ -69,6 +70,32 @@ class Config:
     # оседает в общем каталоге, а при включённом показе «только проект»
     # его не видно -- и добавить в проект тоже нечем.
     import_to_project: bool = True
+    # Кегль текста в превью и в редакторе УГО относительно того, что
+    # уйдёт в Altium. Меньше единицы потому, что Altium отмеряет текст по
+    # высоте прописной буквы, а SVG и Qt -- по полной высоте кегля (em):
+    # у ГОСТ тип Б это отношение примерно 0.72. Значение вынесено в
+    # настройки, чтобы подогнать превью под свой Altium раз и навсегда.
+    preview_font_scale: float = 0.72
+    # Потолок треугольников в 3D-модели, которую мы делаем из OBJ.
+    # Это настройка СКОРОСТИ СБОРКИ, а не качества картинки: замер на
+    # живом проекте -- модель на ~58 тысяч треугольников вставлялась в
+    # посадочное место 337 секунд, соседняя посадка на 355 площадок --
+    # 8,5 секунды. Меньше значение -- быстрее сборка.
+    model_faces: int = 6000
+    # Сажать 3D-тело на плоскость платы. Altium считает Z = 0 плоскостью
+    # платы, а модели из EasyEDA приходят с началом координат где придётся:
+    # у FBGA-96 геометрия шла от -0.37 мм, и шарики уходили ВНУТРЬ платы.
+    # Смещение кладётся в standoff -- сам файл модели не трогаем, он может
+    # быть выбран вручную и чужой. У выводных корпусов посадка не
+    # применяется: там ножки НИЖЕ платы -- это правильно.
+    seat_models: bool = True
+    # Папка текстового зеркала библиотеки -- та, что лежит в git или в
+    # облачной папке отдела. Пусто -- library-git рядом с каталогом.
+    git_dir: str = ""
+    # Выкладывать вместе с компонентами и 3D-модели. STEP текстовый, git
+    # его переваривает, но пара сотен мегабайт в репозитории мало кого
+    # радует -- поэтому по умолчанию выключено.
+    git_models: bool = False
     # прочее
     theme: str = "dark"
     # параметры, вынесенные в таблицу отдельными колонками
@@ -89,6 +116,11 @@ class Config:
     @property
     def lib_dir(self) -> str:
         return self.out_dir or os.path.join(self.root, "library")
+
+    @property
+    def cache_dir(self) -> str:
+        """Скачанное из сети: описания LCSC и OBJ-модели. Удаляется без потерь."""
+        return os.path.join(self.root, "cache")
 
     @property
     def cfg_path(self) -> str:
@@ -124,11 +156,13 @@ class Config:
         st.show_power_marks = self.show_power_marks
         st.ic_fields = self.ic_fields
         st.group_gap_rows = self.group_gap_rows
+        st.compact_symbols = self.compact_symbols
         st.passive_scale = self.passive_scale
         st.color_graphic = self.color_graphic
         st.color_text = self.color_text
         st.color_pin_num = self.color_pin_num
         st.color_pin = self.color_pin
+        st.preview_font_scale = self.preview_font_scale
         return st
 
 

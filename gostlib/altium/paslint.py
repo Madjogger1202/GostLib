@@ -38,7 +38,10 @@ OPERATOR_WORDS = ("in", "is", "as", "or", "to", "of", "do", "div", "mod",
 # переменных лучше не указывать вовсе — связывание будет поздним.
 SAFE_TYPES = {"string", "integer", "boolean", "real", "double", "extended",
               "cardinal", "word", "byte", "char", "tstringlist", "tstrings",
-              "variant", "tobject", "tcoord", "tpoint", "tlocation"}
+              "variant", "tobject", "tcoord", "tpoint", "tlocation",
+              # запись кеша площадки: её нельзя объявить нетипизированной,
+              # это структура, а не интерфейс
+              "tpadcache"}
 
 OPEN_WORDS = ("begin", "case", "try", "record", "class", "object")
 
@@ -81,7 +84,32 @@ ATTESTED = {
 ATTESTED_EXTRA = {"AddSchComponent", "RemoveSchComponent",
                   # часть API пазов вместе с HoleType/HoleWidth;
                   # присваивается только когда угол ненулевой
-                  "HoleRotation"}
+                  "HoleRotation",
+                  # Кеш площадки -- штатный способ задать зазоры маски и
+                  # пасты. Прямое присваивание площадке роняет Altium
+                  # (проверено тремя прогонами), а кеш читается целиком,
+                  # правится и кладётся обратно. Сами имена полей ниже
+                  # разрешены только на кеше: прямое обращение к площадке
+                  # ловит список FATAL.
+                  "GetState_Cache", "SetState_Cache",
+                  "SolderMaskExpansion", "SolderMaskExpansionValid",
+                  "PasteMaskExpansion", "PasteMaskExpansionValid"}
+
+# Члены, которые ДОКАЗАННО роняют Altium. Проверено на 26.8.1 тремя
+# прогонами: посадка без зазоров собирается целиком, посадка с зазором
+# падает на первой же площадке -- Access violation по одному и тому же
+# адресу в ScriptingSystem.DLL. Причина по сути: зазор маски у площадки
+# разрешается через правила ПЛАТЫ, а в .PcbLib платы нет.
+# Ключ -- НАЧАЛО выражения целиком, а не только имя члена: у площадки
+# такого свойства нет, а у её кеша (TPadCache) есть, и через кеш всё
+# работает. Отличать надо по получателю.
+FATAL = {
+    "Pad.SolderMaskExpansion": "у объекта площадки такого свойства нет; "
+                               "правьте кеш: Cache := Pad.GetState_Cache",
+    "Pad.PasteMaskExpansion": "то же самое -- только через кеш площадки",
+    "Pad.SolderMaskExpansionValid": "у площадки этого члена нет",
+    "Pad.PasteMaskExpansionValid": "у площадки этого члена нет",
+}
 
 
 def strip_code(text: str) -> List[str]:
@@ -276,6 +304,27 @@ def check(text: str) -> List[str]:
             in_body = False
         if in_body and re.match(r"^\s*Var\b", c, re.I):
             problems.append(f"строка {n}: Var внутри Begin — не поддерживается")
+
+    # --- 7b. заведомо смертельные члены --------------------------------------
+    for n, c in enumerate(code, 1):
+        for expr, why in FATAL.items():
+            if re.search(re.escape(expr) + r"\s*:=", c):
+                problems.append(
+                    f"строка {n}: '{expr}' роняет Altium — {why}")
+
+    # --- 8. вложенные процедуры ---------------------------------------------
+    # DelphiScript не даёт вложенной процедуре обращаться к переменным
+    # внешней: Altium показывает окно «Can-t access top level variable», и
+    # это не компиляция, а падение на ходу. Компилятора у нас нет, ловим
+    # здесь: любая процедура с отступом -- уже подозрительна.
+    for n, c in enumerate(code, 1):
+        m = re.match(r"^(\s+)(Procedure|Function)\s+(\w+)", c, re.I)
+        if m and m.group(1).strip() == "":
+            problems.append(
+                f"строка {n}: вложенная {m.group(2).lower()} '{m.group(3)}' — "
+                f"в DelphiScript она не видит переменные внешней процедуры "
+                f"(«Can-t access top level variable»); вынесите её на "
+                f"верхний уровень, а общие данные — в глобальные Var")
 
     return problems
 

@@ -123,3 +123,76 @@ class PreviewPane(QWidget):
         self.view.set_svg(text)
         if subtitle:
             self.label.setText(subtitle)
+
+
+# --------------------------------------------------------------- размеры ----
+def relax(w, mw: int = 140, mh: int = 100):
+    """
+    Разрешить панели быть маленькой.
+
+    Ключ -- политика Ignored: при ней Qt перестаёт считать минимумом
+    подсказку раскладки и берёт явно заданный минимум. Одного
+    setMinimumSize мало: подсказка всё равно побеждает, и окно, у
+    которого внутри пара таблиц и три превью, требует под две тысячи
+    пикселей ширины.
+    """
+    from PySide6.QtWidgets import QLayout
+
+    if w is None:
+        return
+    lay = w.layout() if hasattr(w, "layout") else None
+    if lay is not None:
+        lay.setSizeConstraint(QLayout.SetNoConstraint)
+    w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+    w.setMinimumSize(mw, mh)
+
+
+def allow_narrow(root, extra=()):
+    """
+    Снять с окна накопленный минимум: пусть содержимое ужимается, а не
+    диктует размер. Проходим по всем вложенным сплиттерам и вкладкам --
+    именно они складывают минимумы в неподъёмное число.
+    """
+    from PySide6.QtWidgets import QSplitter, QTabWidget
+
+    for tw in root.findChildren(QTabWidget):
+        for i in range(tw.count()):
+            relax(tw.widget(i))
+        relax(tw, 200, 120)
+    for sp in root.findChildren(QSplitter):
+        sp.setChildrenCollapsible(True)
+        for i in range(sp.count()):
+            relax(sp.widget(i))
+        relax(sp, 160, 100)
+    for w in extra:
+        relax(w, 160, 120)
+
+
+def fit_to_screen(win, want_w: int, want_h: int, margin: int = 96):
+    """
+    Задать размер окна, не вылезая за экран, и поставить его по центру
+    ТОГО ЖЕ экрана.
+
+    Инструмент не должен разворачиваться на второй монитор и не должен
+    открываться больше рабочей области: у Qt свободная геометрия -- это
+    экран без панели задач, по ней и равняемся.
+    """
+    from PySide6.QtGui import QGuiApplication
+
+    scr = None
+    try:
+        scr = win.screen()
+    except Exception:
+        scr = None
+    if scr is None:
+        parent = win.parent() if hasattr(win, "parent") else None
+        scr = ((parent.screen() if parent is not None else None)
+               or QGuiApplication.primaryScreen())
+    if scr is None:
+        win.resize(want_w, want_h)
+        return
+    g = scr.availableGeometry()
+    w = max(560, min(int(want_w), g.width() - margin))
+    h = max(420, min(int(want_h), g.height() - margin))
+    win.resize(w, h)
+    win.move(g.x() + (g.width() - w) // 2, g.y() + (g.height() - h) // 2)

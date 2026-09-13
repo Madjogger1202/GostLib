@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -204,6 +205,87 @@ def make_launcher() -> Path:
     return path
 
 
+def clean_build_env() -> dict[str, str]:
+    """Не позволять PyInstaller подмешивать DLL из служебных runtime.
+
+    Desktop-среды разработки могут добавлять в PATH собственные Poppler,
+    LibreOffice и другие наборы DLL.  Анализатор зависимостей видит их как
+    подходящие системные библиотеки и, например, кладёт poppler-овскую
+    ``icuuc.dll`` рядом с Qt.  В исходном Python Qt использует ICU из
+    System32, а собранный exe после такой подмены падает ещё до открытия
+    окна с ``DLL load failed: procedure not found``.
+
+    Зависимости самого проекта приходят через sys.path/PYTHONPATH и от этой
+    фильтрации не страдают.
+    """
+    env = dict(os.environ)
+    path_items = env.get("PATH", "").split(os.pathsep)
+    foreign_markers = ("\\.cache\\codex-runtimes\\",)
+    env["PATH"] = os.pathsep.join(
+        item for item in path_items
+        if not any(marker in item.lower() for marker in foreign_markers)
+    )
+    return env
+
+
+def sweep_old(dist: Path) -> int:
+    """
+    Подобрать хвосты прошлых сборок: GostLib.old-*.exe.
+
+    Файл, который был занят запущенной программой, мы переименовываем, а
+    не удаляем -- Windows переименовать работающий exe разрешает, удалить
+    нет. Мусор убираем при следующем запуске, когда программа уже закрыта.
+    """
+    n = 0
+    if not dist.is_dir():
+        return 0
+    for p in dist.glob("*.old-*.exe"):
+        try:
+            p.unlink()
+            n += 1
+        except OSError:
+            pass                      # всё ещё запущен -- уберём в другой раз
+    return n
+
+
+def locked(path: Path) -> bool:
+    """Занят ли файл. Проверяем попыткой открыть на запись -- на Windows
+    работающий exe открыть так нельзя."""
+    if not path.is_file():
+        return False
+    try:
+        with open(path, "r+b"):
+            return False
+    except OSError:
+        return True
+
+
+def free_target(exe: Path) -> bool:
+    """
+    Освободить место под новый exe.
+
+    Самая частая причина «Отказано в доступе: dist\\GostLib.exe» -- сама
+    программа сейчас запущена. PyInstaller в этом месте просто падает
+    трассировкой, из которой ничего не понятно. Переименовываем занятый
+    файл: Windows это разрешает, сборка идёт дальше, а старый файл
+    удалится при следующем запуске. Возвращает False, если и это не
+    вышло, -- тогда честно скажем, что делать.
+    """
+    if not locked(exe):
+        return True
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    spare = exe.with_name(f"{exe.stem}.old-{stamp}.exe")
+    try:
+        exe.rename(spare)
+        log(f"{exe.name} занят (программа запущена) — отложил его в "
+            f"{spare.name}, соберу новый.")
+        log("Старый файл удалится сам при следующей сборке.")
+        return True
+    except OSError as exc:
+        log(f"{exe.name} занят и не переименовывается: {exc}")
+        return False
+
+
 def human_size(n: int) -> str:
     mb = n / (1024 * 1024)
     return f"{mb:.1f} МБ ({n} байт)"
@@ -244,6 +326,23 @@ def main() -> int:
             if d.exists():
                 log(f"Удаляю {d}")
                 shutil.rmtree(d, ignore_errors=True)
+
+    # Прошлый exe может быть занят: чаще всего просто запущена сама
+    # программа. Разбираемся с этим ДО PyInstaller -- он на этом месте
+    # падает трассировкой, в которой причина не видна.
+    dropped = sweep_old(DIST_DIR)
+    if dropped:
+        log(f"Убрал {dropped} файл(ов) от прошлых сборок")
+    target = DIST_DIR / f"{args.name}.exe"
+    if not free_target(target):
+        log("")
+        log("Закройте запущенный GostLib и повторите сборку.")
+        log("Если программа закрыта, файл держит антивирус или проводник:")
+        log(f"  * добавьте {DIST_DIR} в исключения антивируса;")
+        log("  * закройте окно проводника, открытое на этой папке.")
+        log("Найти, кто держит файл:")
+        log(f'  powershell "Get-Process | ? {{$_.Path -eq \'{target}\'}}"')
+        return 1
 
     ico = ensure_icon()
     launcher = make_launcher()
@@ -309,7 +408,7 @@ def main() -> int:
     log("Запускаю PyInstaller (первый раз это 2-5 минут)...")
     log("")
     try:
-        rc = subprocess.call(cmd)
+        rc = subprocess.call(cmd, env=clean_build_env())
     except OSError as exc:
         log(f"Не удалось запустить PyInstaller: {exc}")
         return 1

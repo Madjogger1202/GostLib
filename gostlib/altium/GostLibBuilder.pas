@@ -16,6 +16,8 @@
                                (заодно видно, не поехала ли кириллица)
      GostLibListInstalled   -- какие библиотеки подключены
 
+  Зазоры маски и пасты в библиотеке НЕ ЗАДАЮТСЯ -- см. AddPad.
+
   Формат задания -- строки «тег<TAB>поле<TAB>поле...»:
 
      VER      3
@@ -36,7 +38,8 @@
      VENDOR   <путь к чужой .PcbLib -- только подключить>
 
      FP    имя  описание  высота
-     PAD   номер x y w h форма поворот*10 слой отверстие металлиз длина_паза угол_паза*10
+     PAD   номер x y w h форма поворот*10 слой отверстие металлиз длина_паза
+           угол_паза*10 [зазор_маски] [зазор_пасты]   (пусто = правило проекта)
      TRK   слой ширина x1 y1 x2 y2
      FARC  слой ширина cx cy r угол1*10 угол2*10
      FTXT  слой x y высота поворот*10 ширина зеркало текст
@@ -99,6 +102,47 @@ Var
     GNPad     : Integer;
     GNBody    : Integer;
     GNPin     : Integer;
+    GNText    : Integer;
+    { сколько строк дописано в журнал с прошлой записи на диск }
+    GLogDirty : Integer;
+    { кеш идентификаторов шрифта: ключ = кегль*2 + признак жирного }
+    GFcN      : Integer;
+    GFcKey    : Array[0..63] Of Integer;
+    GFcVal    : Array[0..63] Of Integer;
+    { момент начала всей сборки -- для итоговой строки в журнале }
+    GTotal    : Real;
+    { Зазоры маски/пасты: сколько поставили и сколько не вышло.
+      GExpTried -- пробовали ли уже (чтобы не сорить в журнал). }
+    GNExp     : Integer;
+    GSkipExp  : Integer;
+    GExpTried : Integer;
+
+{ ============================================================== часы ====== }
+
+{ Миллисекунды, прошедшие с момента T (значение Now).
+  Замер нужен затем, что «сборка идёт минуты» -- утверждение, которое
+  нечем проверить: непонятно, где именно эти минуты. Теперь в журнале
+  видно время каждого этапа и каждого компонента. }
+Function MsSince(T : Real) : Integer;
+Begin
+    Result := 0;
+    Try
+        Result := Round((Now - T) * 86400000.0);
+    Except
+        Result := 0;
+    End;
+End;
+
+Function NowT : Real;
+Begin
+    Result := 0;
+    Try
+        Result := Now;
+    Except
+        Result := 0;
+    End;
+End;
+
 { ============================================================== журнал ==== }
 
 Procedure FlushLog;
@@ -106,20 +150,30 @@ Begin
     If (GLog = Nil) Or (GLogPath = '') Then Exit;
     Try
         GLog.SaveToFile(GLogPath);
+        GLogDirty := 0;
     Except
     End;
 End;
 
+{ Журнал пишется пачками.
+
+  Раньше каждая строка тут же сохранялась на диск целым файлом: к концу
+  сборки журнал переписывался столько раз, сколько в нём строк, и это
+  квадрат по объёму записи. На паре BGA с сотнями выводов заметно. }
 Procedure Say(S : String);
 Begin
     If GLog <> Nil Then GLog.Add(S);
-    FlushLog;
+    GLogDirty := GLogDirty + 1;
+    If GLogDirty >= 40 Then FlushLog;
 End;
 
 Procedure SayErr(S : String);
 Begin
     GErr := GErr + 1;
     Say('ОШИБКА: ' + S);
+    { ошибку сбрасываем на диск сразу: если следом скрипт упадёт,
+      она должна остаться в файле }
+    FlushLog;
 End;
 
 Procedure SayWarn(S : String);
@@ -411,6 +465,7 @@ End;
 Procedure AddPad(Comp, line);
 Var
     Pad;
+    Cache     : TPadCache;
     shp       : Integer;
     sz        : Integer;
     hl        : Integer;
@@ -468,6 +523,51 @@ Begin
     Pad.Name := FldS(line, 2);
     Comp.AddPCBObject(Pad);
     GNPad := GNPad + 1;
+
+    { Зазоры маски и пасты -- через КЕШ площадки, а не напрямую.
+
+      Прямое присваивание Pad.SolderMaskExpansion роняет Altium: три
+      прогона, три Access violation по одному адресу в
+      ScriptingSystem.DLL. Последний снял вопрос -- посадка без зазоров
+      собралась целиком (96 площадок), следующая с зазором упала на
+      первой же, хотя площадка уже была в компоненте. То есть у объекта
+      площадки такого свойства просто нет, и обращение уходит в никуда.
+
+      Правильный путь у Altium другой: зазоры лежат в записи-кеше
+      площадки (TPadCache) вместе с признаком «задано вручную». Кеш
+      читается целиком, правится и кладётся обратно.
+
+      Первая площадка с зазором пишется в журнал с принудительным
+      сбросом на диск: если и этот путь окажется тупиковым, в файле
+      останется ровно та строка, на которой всё кончилось. }
+    If (Trim(Fld(line, 14)) <> '') Or (Trim(Fld(line, 15)) <> '') Then
+    Begin
+        If GExpTried = 0 Then
+        Begin
+            GExpTried := 1;
+            Say('    зазоры маски/пасты через кеш площадки, первая: ' +
+                Fld(line, 2));
+            FlushLog;
+        End;
+        Try
+            Cache := Pad.GetState_Cache;
+            If Trim(Fld(line, 14)) <> '' Then
+            Begin
+                Cache.SolderMaskExpansion := FldI(line, 14);
+                Cache.SolderMaskExpansionValid := eCacheManual;
+            End;
+            If Trim(Fld(line, 15)) <> '' Then
+            Begin
+                Cache.PasteMaskExpansion := FldI(line, 15);
+                Cache.PasteMaskExpansionValid := eCacheManual;
+            End;
+            Pad.SetState_Cache := Cache;
+            GNExp := GNExp + 1;
+        Except
+            GSkipExp := GSkipExp + 1;
+        End;
+    End;
+
 End;
 
 Procedure AddTrack(Comp, Lib, line);
@@ -544,6 +644,8 @@ Var
     Body;
     Mdl;
     path  : String;
+    tBody : Real;
+    ms    : Integer;
 Begin
     path := FldS(line, 2);
     If Not FileExists(path) Then
@@ -551,6 +653,11 @@ Begin
         SayWarn('3D-модель не найдена: ' + path);
         Exit;
     End;
+    { Разбор STEP -- самая дорогая операция во всей сборке, и по времени
+      посадки этого было не видно: замер показал 337 секунд на одну модель
+      против 8,5 секунды на соседнюю посадку из 355 площадок. Меряем
+      отдельно, чтобы это больше не выглядело загадкой. }
+    tBody := NowT;
     Body := PCBServer.PCBObjectFactory(eComponentBodyObject, eNoDimension,
                                        eCreate_Default);
     If Body = Nil Then
@@ -591,6 +698,12 @@ Begin
         Except
         End;
     GNBody := GNBody + 1;
+    ms := MsSince(tBody);
+    Say('    3D: ' + ExtractFileName(path) + ' — ' + IntToStr(ms) + ' мс');
+    If ms > 20000 Then
+        Say('    подсказка: модель разбиралась дольше 20 с. Уменьшите ' +
+            '«подробность 3D» в настройках GostLib и нажмите ' +
+            '«Пережать 3D-модели» — сборка ускорится в разы.');
 End;
 
 { Убрать из библиотеки посадку с таким именем (если она там уже есть). }
@@ -631,9 +744,16 @@ Var
     t     : String;
     FpOpen  : Boolean;
     nm    : String;
+    tPhase    : Real;
+    tComp     : Real;
+    tMark     : Real;
+    nPadWas   : Integer;
 Begin
     If GPcbPath = '' Then Exit;
 
+    tPhase := NowT;
+    tComp := tPhase;
+    nPadWas := 0;
     Say('');
     Say('Библиотека посадочных мест: ' + GPcbPath);
     CloseIfOpen(GPcbPath);
@@ -658,7 +778,9 @@ Begin
         SayErr('не удалось открыть/создать ' + GPcbPath);
         Exit;
     End;
+    tMark := NowT;
     Client.ShowDocument(SrvDoc);
+    Say('  открытие документа: ' + IntToStr(MsSince(tMark)) + ' мс');
 
     If PCBServer = Nil Then
     Begin
@@ -685,7 +807,11 @@ Begin
             Begin
                 nm := FldS(line, 2);
                 If nm = '' Then Continue;
-                DropPcbComp(Lib, nm);
+                { при FRESH библиотека только что создана с нуля --
+                  искать в ней одноимённую посадку незачем }
+                If GFresh <> 1 Then DropPcbComp(Lib, nm);
+                tComp := NowT;
+                nPadWas := GNPad;
                 Comp := PCBServer.CreatePCBLibComp;
                 If Comp = Nil Then
                 Begin
@@ -709,6 +835,8 @@ Begin
             End
             Else If (t = 'ENDFP') And FpOpen Then
             Begin
+                Say('    площадок ' + IntToStr(GNPad - nPadWas) +
+                    ', ' + IntToStr(MsSince(tComp)) + ' мс');
                 Comp := Nil;
                 FpOpen := False;
             End
@@ -737,14 +865,18 @@ Begin
         Lib.Board.ViewManager_FullUpdate;
     Except
     End;
+    tMark := NowT;
     Try
         SrvDoc.DoFileSave('PCBLIB');
         Say('  сохранена, посадок ' + IntToStr(GNFp) +
             ', площадок ' + IntToStr(GNPad) +
-            ', 3D-моделей ' + IntToStr(GNBody));
+            ', 3D-моделей ' + IntToStr(GNBody) +
+            ' (запись ' + IntToStr(MsSince(tMark)) + ' мс)');
     Except
         SayErr('не удалось сохранить ' + GPcbPath);
     End;
+    Say('  ПОСАДКИ ВСЕГО: ' + IntToStr(MsSince(tPhase)) + ' мс');
+    FlushLog;
 
     { Перечитываем то, что получилось: в журнале должно быть видно, что
       в библиотеке лежит ровно то, что ожидалось. }
@@ -763,14 +895,37 @@ End;
 
 { ====================================================== сборка .SchLib ==== }
 
+{ Идентификатор шрифта с кешем.
+
+  `FontManager.GetFontID` ищет шрифт в таблице документа и при
+  необходимости заводит новую запись -- вызов недешёвый. А зовётся он на
+  КАЖДЫЙ текстовый объект: у BGA на 484 вывода это около полутора тысяч
+  вызовов на один компонент, при том что разных сочетаний «кегль +
+  жирность» во всём задании штук пять. Кешируем. }
 Function FontIdFor(Size : Integer; Bold : Boolean) : Integer;
+Var
+    key, i : Integer;
 Begin
+    key := Size * 2;
+    If Bold Then key := key + 1;
+    For i := 0 To GFcN - 1 Do
+        If GFcKey[i] = key Then
+        Begin
+            Result := GFcVal[i];
+            Exit;
+        End;
     Result := 0;
     Try
         Result := SchServer.FontManager.GetFontID(Size, 0, False, False,
                                                   Bold, False, GFont);
     Except
         Result := 0;
+    End;
+    If GFcN <= 63 Then
+    Begin
+        GFcKey[GFcN] := key;
+        GFcVal[GFcN] := Result;
+        GFcN := GFcN + 1;
     End;
 End;
 
@@ -945,6 +1100,7 @@ Begin
     End;
     L.Text := FldS(line, 9);
     Comp.AddSchObject(L);
+    GNText := GNText + 1;
 End;
 
 Procedure AddSchParam(Comp, line, X, Y);
@@ -1039,9 +1195,18 @@ Var
     dX, dY    : Integer;
     pY        : Integer;
     parts     : Integer;
+    tPhase    : Real;
+    tComp     : Real;
+    tMark     : Real;
+    nPinWas   : Integer;
+    nTxtWas   : Integer;
 Begin
     If GSchPath = '' Then Exit;
 
+    tPhase := NowT;
+    tComp := tPhase;
+    nPinWas := 0;
+    nTxtWas := 0;
     Say('');
     Say('Схемная библиотека: ' + GSchPath);
     CloseIfOpen(GSchPath);
@@ -1066,7 +1231,9 @@ Begin
         SayErr('не удалось открыть/создать ' + GSchPath);
         Exit;
     End;
+    tMark := NowT;
     Client.ShowDocument(SrvDoc);
+    Say('  открытие документа: ' + IntToStr(MsSince(tMark)) + ' мс');
 
     If SchServer = Nil Then
     Begin
@@ -1093,7 +1260,11 @@ Begin
         Begin
             nm := FldS(line, 2);
             If nm = '' Then Continue;
-            DropSchComp(Lib, nm);
+            { при FRESH библиотека создана с нуля -- искать нечего }
+            If GFresh <> 1 Then DropSchComp(Lib, nm);
+            tComp := NowT;
+            nPinWas := GNPin;
+            nTxtWas := GNText;
             Comp := SchServer.SchObjectFactory(eSchComponent, eCreate_Default);
             If Comp = Nil Then
             Begin
@@ -1141,6 +1312,9 @@ Begin
                 End;
                 GNComp := GNComp + 1;
                 If GMadeSch <> Nil Then GMadeSch.Add(nm);
+                Say('    выводов ' + IntToStr(GNPin - nPinWas) +
+                    ', текстов ' + IntToStr(GNText - nTxtWas) +
+                    ', ' + IntToStr(MsSince(tComp)) + ' мс');
             End;
             Comp := Nil;
             SymOpen := False;
@@ -1182,17 +1356,36 @@ Begin
         End;
     End;
 
+    { В свежесозданной схемной библиотеке остаётся пустая заготовка
+      Component_1 -- ровно как PCBCOMPONENT_1 у посадок. В панели
+      Components она видна наравне с настоящими компонентами и ставится
+      на лист пустым прямоугольником. }
+    If GNComp > 0 Then
+    Begin
+        DropSchComp(Lib, 'Component_1');
+        DropSchComp(Lib, 'COMPONENT_1');
+    End;
+
     Try
         Lib.GraphicallyInvalidate;
     Except
     End;
+    tMark := NowT;
     Try
         SrvDoc.DoFileSave('SCHLIB');
         Say('  сохранена, символов ' + IntToStr(GNComp) +
-            ', выводов ' + IntToStr(GNPin));
+            ', выводов ' + IntToStr(GNPin) +
+            ', текстов ' + IntToStr(GNText) +
+            ' (запись ' + IntToStr(MsSince(tMark)) + ' мс)');
     Except
         SayErr('не удалось сохранить ' + GSchPath);
     End;
+    Say('  СИМВОЛЫ ВСЕГО: ' + IntToStr(MsSince(tPhase)) + ' мс');
+    If GNText > 2 * GNPin Then
+        Say('  подсказка: текстовых объектов больше, чем выводов вдвое. ' +
+            'Каждый такой объект Altium создаёт отдельно; если сборка ' +
+            'долгая, выключите «номера выводов своим текстом» в настройках.');
+    FlushLog;
 
     Try
         Say('  в схемной библиотеке сейчас:');
@@ -1427,6 +1620,9 @@ Var
 Begin
     GErr := 0; GWarn := 0;
     GNComp := 0; GNFp := 0; GNPad := 0; GNBody := 0; GNPin := 0;
+    GNText := 0; GLogDirty := 0; GFcN := 0;
+    GSkipExp := 0; GNExp := 0; GExpTried := 0;
+    GTotal := NowT;
 
     JobPath := FindJobFile;
     If (JobPath = '') Or (Not FileExists(JobPath)) Then
@@ -1503,6 +1699,15 @@ Begin
         Say(msg);
         Say('Предупреждений: ' + IntToStr(GWarn) +
             ', ошибок: ' + IntToStr(GErr));
+        If GNExp > 0 Then
+            Say('Зазоры маски/пасты заданы у площадок: ' + IntToStr(GNExp));
+        If GSkipExp > 0 Then
+        Begin
+            Say('');
+            Say('Зазоры не легли на площадок: ' + IntToStr(GSkipExp) + '.');
+            Say('Проверьте вкладку Solder/Paste в свойствах площадки.');
+        End;
+        Say('ВСЯ СБОРКА: ' + IntToStr(MsSince(GTotal)) + ' мс');
         FlushLog;
 
         ShowMessage(msg + #13#10 +
@@ -1525,7 +1730,6 @@ Begin
     End;
 End;
 
-{ ========================================================= диагностика ==== }
 
 Procedure GostLibWhereIsJob;
 Begin

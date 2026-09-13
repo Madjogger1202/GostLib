@@ -12,6 +12,10 @@ from ..gost.style import DEFAULT, PT2MIL, Style
 # семейства и берёт первое попавшееся, из-за чего кегль на превью не
 # совпадает с тем, что получается в Altium.
 FONT = "GOST type B"
+# Запасное значение, если стиль пришёл без настройки. Altium отмеряет
+# текст по высоте прописной буквы, а SVG -- по полной высоте кегля, отсюда
+# множитель меньше единицы. Настраивается: Настройки -> «кегль превью».
+COMPACT_FONT_SCALE = 0.72
 
 # Превью рисуется теми же цветами, что уйдут в Altium: чёрным. Иначе
 # «на превью красиво, а на схеме иначе».
@@ -50,6 +54,12 @@ def symbol_svg(comp: Component, st: Optional[Style] = None,
     не видны. Поэтому окно превью показывает одну секцию.
     """
     st = (st or DEFAULT).for_component(comp)
+    # QSvgRenderer корректно принимает семейство целиком как значение
+    # атрибута; CSS-списки с запасными шрифтами он, напротив, обрабатывает
+    # нестабильно. Используем ровно то имя, которое уйдёт в Altium.
+    font = _esc(st.font or FONT)
+    font_scale = float(getattr(st, "preview_font_scale", 0) or
+                       COMPACT_FONT_SCALE)
     sym = comp.symbol
     part = int(part or 0)
     if part:
@@ -78,7 +88,25 @@ def symbol_svg(comp: Component, st: Optional[Style] = None,
             track(pt[0] - pr.radius, pt[1] - pr.radius)
             track(pt[0] + pr.radius, pt[1] + pr.radius)
             if pr.kind == "text":
-                track(pt[0] + st.text_w(pr.text, pr.size), pt[1])
+                tw = st.text_w(pr.text, pr.size)
+                if pr.justify == 2:
+                    track(pt[0] - tw, pt[1])
+                elif pr.justify == 1:
+                    track(pt[0] - tw / 2, pt[1])
+                    track(pt[0] + tw / 2, pt[1])
+                else:
+                    track(pt[0] + tw, pt[1])
+
+    # Штатные Designator и Comment не входят в prims, но участвуют в
+    # габарите превью. Иначе длинный партномер мог обрезаться краем SVG.
+    dx, dy = sym.designator_pos
+    track(dx + st.text_w(comp.designator, st.size_desig), dy)
+    from .. import classify
+    label = classify.label_for(comp)
+    cx, cy = sym.comment_pos
+    ctw = st.text_w(label, st.size_type)
+    track(cx - ctw / 2, cy)
+    track(cx + ctw / 2, cy)
 
     pad = 150
     minx, maxx = min(xs) - pad, max(xs) + pad
@@ -135,23 +163,29 @@ def symbol_svg(comp: Component, st: Optional[Style] = None,
                 f'{pr.radius:.1f} 0 {large} 0 {X(x2):.1f} {Y(y2):.1f}" '
                 f'fill="none" stroke="{body}" stroke-width="{sw}"/>')
         elif pr.kind == "ellipse" and pr.pts:
-            cx, cy = pr.pts[0]
+            ecx, ecy = pr.pts[0]      # не cx/cy: см. примечание выше
             parts.append(
-                f'<circle cx="{X(cx):.1f}" cy="{Y(cy):.1f}" r="{pr.radius:.1f}" '
+                f'<circle cx="{X(ecx):.1f}" cy="{Y(ecy):.1f}" r="{pr.radius:.1f}" '
                 f'fill="{"#fffbe6" if pr.filled else "none"}" stroke="{body}" '
                 f'stroke-width="{sw}"/>')
         elif pr.kind == "text" and pr.pts:
             x, y = pr.pts[0]
             anchor = {0: "start", 1: "middle", 2: "end"}.get(pr.justify, "start")
-            fs = pr.size * PT2MIL
-            dy = {0: 0.0, 1: fs * 0.33, 2: fs * 0.78}.get(pr.vjustify, fs * 0.33)
+            fs = pr.size * PT2MIL * font_scale
+            # ВНИМАНИЕ: имя не dy. Раньше здесь была именно dy, и она
+            # затирала координату позиционного обозначения, взятую выше, --
+            # «R?» в превью рисовалось в середине корпуса у ЛЮБОГО
+            # компонента. В Altium при этом всё было на месте, потому что
+            # туда координата уходит из задания, а не отсюда.
+            voff = {0: 0.0, 1: fs * 0.33,
+                    2: fs * 0.78}.get(pr.vjustify, fs * 0.33)
             rot = ""
             if pr.rotation:
                 rot = f' transform="rotate({-pr.rotation} {X(x):.1f} {Y(y):.1f})"'
             parts.append(
-                f'<text x="{X(x):.1f}" y="{Y(y) + dy:.1f}" fill="{txt}" '
+                f'<text x="{X(x):.1f}" y="{Y(y) + voff:.1f}" fill="{txt}" '
                 f'font-size="{fs:.1f}" text-anchor="{anchor}"{rot} '
-                f'font-family="{FONT}">{_esc(pr.text)}</text>')
+                f'font-family="{font}">{_esc(pr.text)}</text>')
 
     for p, ex, ey in pin_end:
         parts.append(
@@ -160,42 +194,41 @@ def symbol_svg(comp: Component, st: Optional[Style] = None,
         parts.append(f'<circle cx="{X(ex):.1f}" cy="{Y(ey):.1f}" r="8" '
                      f'fill="none" stroke="{body}" stroke-width="3"/>')
         if p.show_number and p.number:
-            fs = st.size_pin * PT2MIL * 0.85
+            fs = st.size_pin_num * PT2MIL * font_scale
             mx, my = (p.x + ex) / 2, (p.y + ey) / 2
             if p.rotation % 180 == 0:
                 parts.append(
                     f'<text x="{X(mx):.1f}" y="{Y(my) - 18:.1f}" fill="{body}" '
                     f'font-size="{fs:.1f}" text-anchor="middle" '
-                    f'font-family="{FONT}">'
+                    f'font-family="{font}">'
                     f'{_esc(p.number)}</text>')
             else:
                 parts.append(
                     f'<text x="{X(mx) + 18:.1f}" y="{Y(my):.1f}" fill="{body}" '
                     f'font-size="{fs:.1f}" text-anchor="start" '
-                    f'font-family="{FONT}">'
+                    f'font-family="{font}">'
                     f'{_esc(p.number)}</text>')
         if p.show_name and p.name:
-            fs = st.size_pin * PT2MIL * 0.9
+            fs = st.size_pin * PT2MIL * font_scale
             anchor = "end" if p.rotation % 360 == 180 else "start"
             ox = -20 if anchor == "end" else 20
             parts.append(
                 f'<text x="{X(ex) + ox:.1f}" y="{Y(ey) + fs*0.33:.1f}" '
                 f'fill="{txt}" font-size="{fs:.1f}" text-anchor="{anchor}" '
-                f'font-family="{FONT}">{_esc(p.name)}</text>')
+                f'font-family="{font}">{_esc(p.name)}</text>')
 
-    dx, dy = sym.designator_pos
-    fsd = st.size_desig * PT2MIL
+    fsd = st.size_desig * PT2MIL * font_scale
+    dx, dy = sym.designator_pos        # именно здесь, а не за сто строк до
+    cx, cy = sym.comment_pos
     parts.append(
         f'<text x="{X(dx):.1f}" y="{Y(dy):.1f}" fill="{SYM_COLORS["desig"]}" '
-        f'font-size="{fsd:.1f}" font-family="{FONT}">'
+        f'font-size="{fsd:.1f}" font-family="{font}">'
         f'{_esc(comp.designator)}</text>')
-    cx, cy = sym.comment_pos
-    from .. import classify
-    label = classify.label_for(comp)
+    fsc = st.size_type * PT2MIL * font_scale
     parts.append(
-        f'<text x="{X(cx):.1f}" y="{Y(cy) + fsd*0.33:.1f}" fill="#a00000" '
-        f'font-size="{fsd:.1f}" text-anchor="middle" '
-        f'font-family="{FONT}">{_esc(label)}</text>')
+        f'<text x="{X(cx):.1f}" y="{Y(cy) + fsc*0.33:.1f}" fill="#a00000" '
+        f'font-size="{fsc:.1f}" text-anchor="middle" '
+        f'font-family="{font}">{_esc(label)}</text>')
 
     bg = "#1e1e1e" if dark else "#ffffff"
     return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0f} {h:.0f}" '
@@ -209,10 +242,14 @@ def symbol_svg(comp: Component, st: Optional[Style] = None,
 def footprint_svg(fp: Footprint, width: int = 700, dark: bool = True) -> str:
     parts: List[str] = []
     xs, ys = [0.0], [0.0]
+    # Фигуры на слоях маски и пасты не показываем: Altium эти окна делает
+    # сам из площадок, а нарисованные источником -- дубликат, который в
+    # превью выглядит рамкой вокруг каждой площадки.
+    prims = [pr for pr in fp.prims if pr.layer not in ("paste", "mask")]
     for p in fp.pads:
         xs += [p.x - p.w, p.x + p.w]
         ys += [p.y - p.h, p.y + p.h]
-    for pr in fp.prims:
+    for pr in prims:
         for pt in pr.pts:
             xs += [pt[0] - pr.radius, pt[0] + pr.radius]
             ys += [pt[1] - pr.radius, pt[1] + pr.radius]
@@ -229,7 +266,7 @@ def footprint_svg(fp: Footprint, width: int = 700, dark: bool = True) -> str:
         return (maxy - v) * K
 
     order = {"courtyard": 0, "assy": 1, "mech": 2, "silk_bot": 3, "silk": 4}
-    for pr in sorted(fp.prims, key=lambda p: order.get(p.layer, 5)):
+    for pr in sorted(prims, key=lambda p: order.get(p.layer, 5)):
         col = FP_LAYER_COLORS.get(pr.layer, "#808080")
         sw = max(1.0, pr.width * K)
         if pr.kind == "line" and len(pr.pts) >= 2:
@@ -261,24 +298,33 @@ def footprint_svg(fp: Footprint, width: int = 700, dark: bool = True) -> str:
             parts.append(f'<polygon points="{pts}" fill="{col}" fill-opacity="0.5" '
                          f'stroke="{col}" stroke-width="1"/>')
 
+    # Контур площадки считается один раз в милиметрах и одинаково для
+    # превью и для просмотра 3D. Раньше здесь рисовали «на глаз»: овал
+    # выходил эллипсом (у настоящего obround борта прямые),
+    # восьмиугольник -- прямоугольником, а паз -- круглым отверстием
+    # вдвое короче настоящего.
+    from ..ir import hole_polygon, pad_polygon
+
     for p in fp.pads:
         col = FP_LAYER_COLORS.get(p.layer, "#c04040")
         cx, cy = X(p.x), Y(p.y)
         pw, ph = p.w * K, p.h * K
-        rot = -p.rot
-        if p.shape in ("round", "oval"):
-            parts.append(f'<ellipse cx="{cx:.1f}" cy="{cy:.1f}" rx="{pw/2:.1f}" '
-                         f'ry="{ph/2:.1f}" fill="{col}" '
-                         f'transform="rotate({rot:.1f} {cx:.1f} {cy:.1f})"/>')
-        else:
-            rx = pw * (p.corner_radius / 100.0) if p.corner_radius else 0
-            parts.append(f'<rect x="{cx-pw/2:.1f}" y="{cy-ph/2:.1f}" '
-                         f'width="{pw:.1f}" height="{ph:.1f}" rx="{rx:.1f}" '
-                         f'fill="{col}" '
-                         f'transform="rotate({rot:.1f} {cx:.1f} {cy:.1f})"/>')
-        if p.hole > 0:
+        if (p.shape or "rect").lower() == "round" and abs(p.w - p.h) < 1e-9:
             parts.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" '
-                         f'r="{p.hole*K/2:.1f}" fill="{FP_LAYER_COLORS["hole"]}"/>')
+                         f'r="{pw / 2:.1f}" fill="{col}"/>')
+        else:
+            pts = " ".join(f"{X(a):.1f},{Y(b):.1f}"
+                           for a, b in pad_polygon(p))
+            parts.append(f'<polygon points="{pts}" fill="{col}"/>')
+        if p.hole > 0:
+            hp = hole_polygon(p)
+            hc = FP_LAYER_COLORS["hole"]
+            if len(hp) >= 3:
+                pts = " ".join(f"{X(a):.1f},{Y(b):.1f}" for a, b in hp)
+                parts.append(f'<polygon points="{pts}" fill="{hc}"/>')
+            else:
+                parts.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" '
+                             f'r="{p.hole * K / 2:.1f}" fill="{hc}"/>')
         parts.append(f'<text x="{cx:.1f}" y="{cy + min(pw,ph)*0.18:.1f}" '
                      f'fill="#ffffff" font-size="{max(6, min(pw,ph)*0.5):.1f}" '
                      f'text-anchor="middle" font-family="Arial">'

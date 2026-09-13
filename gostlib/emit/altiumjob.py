@@ -118,9 +118,15 @@ def _rot4(v: float) -> int:
 class _Job:
     def __init__(self):
         self.lines: List[str] = []
+        self.notes: List[str] = []
 
     def add(self, *fields):
         self.lines.append("\t".join(str(f) for f in fields))
+
+    def note(self, text: str):
+        """Замечание для отчёта: в задание не попадает, в лог -- да."""
+        if text not in self.notes:
+            self.notes.append(text)
 
     def text(self) -> str:
         return "\n".join(self.lines) + "\n"
@@ -204,10 +210,55 @@ def _emit_symbol(j: _Job, sym: Symbol, st: Style):
 
 # ---------------------------------------------------------- посадочное место --
 PAD_SHAPE = {"round": 1, "oval": 1, "rect": 2, "roundrect": 3, "octagon": 4}
+
+# Меньше этого окно в трафарете не имеет смысла: лазер режет от ~0,1 мм,
+# а Altium окно тоньше десятка микрон рисует уже не формой площадки, а
+# каким-то огрызком. Ниже этой ширины зазор пасты ограничивается.
+MIN_PASTE = 0.05
 FP_LAYER = {
     "silk": 1, "silk_bot": 2, "assy": 3, "courtyard": 4, "keepout": 5,
     "mech": 6, "copper_top": 7, "copper_bot": 8, "paste": 9, "mask": 10,
 }
+
+
+def _paste_grid(j: _Job, fp: Footprint, p: Pad) -> bool:
+    """
+    Разбить окно пасты крупной площадки на сетку квадратиков.
+
+    Возвращает True, если сетка поставлена -- тогда собственное окно
+    площадки нужно закрыть отрицательным зазором.
+
+    Повёрнутые площадки пропускаем: заливка в задании прямоугольная и
+    без угла, а рисовать косую сетку отрезками -- получить кашу вместо
+    трафарета. Про такую площадку честно пишем в отчёт.
+    """
+    n = int(getattr(fp, "paste_grid", 0) or 0)
+    if n < 2 or not getattr(fp, "paste", True):
+        return False
+    if min(p.w or 0.0, p.h or 0.0) < float(getattr(fp, "paste_grid_over", 1.0)):
+        return False
+    if abs(float(getattr(p, "rot", 0.0)) % 180.0) > 0.01:
+        j.note(f"{fp.name}/{p.number}: площадка повёрнута — сетку пасты "
+               f"не ставлю, окно осталось сплошным")
+        return False
+    fill = max(10.0, min(100.0, float(getattr(fp, "paste_grid_fill", 60.0))))
+    k = (fill / 100.0) ** 0.5          # доля стороны, чтобы площадь = fill
+    stepx, stepy = (p.w or 0.0) / n, (p.h or 0.0) / n
+    ax, ay = stepx * k, stepy * k      # сторона одного окошка
+    if min(ax, ay) < MIN_PASTE:
+        j.note(f"{fp.name}/{p.number}: сетка {n}x{n} дала бы окошки "
+               f"{min(ax, ay):.3f} мм — мельче, чем режет трафарет; "
+               f"оставил сплошное окно")
+        return False
+    x0 = p.x - (p.w or 0.0) / 2.0 + stepx / 2.0
+    y0 = p.y - (p.h or 0.0) / 2.0 + stepy / 2.0
+    for iy in range(n):
+        for ix in range(n):
+            cx, cy = x0 + ix * stepx, y0 + iy * stepy
+            j.add("FILL", FP_LAYER["paste"],
+                  mm(cx - ax / 2.0), mm(cy - ay / 2.0),
+                  mm(cx + ax / 2.0), mm(cy + ay / 2.0))
+    return True
 
 
 def _emit_footprint(j: _Job, fp: Footprint):
@@ -217,11 +268,59 @@ def _emit_footprint(j: _Job, fp: Footprint):
                  "multi": 3}.get(p.layer, 1)
         if p.hole > 0:
             layer = 3
+        # Зазоры маски и пасты. Пусто -- «не задано»: скрипт не трогает
+        # свойство, и Altium применяет правило проекта. Значение площадки
+        # важнее значения посадки; общего на всю библиотеку нет и быть не
+        # должно -- зазор это свойство корпуса.
+        def _exp(own, fp_val):
+            v = own if own is not None else fp_val
+            return "" if v is None else mm(v)
+
+        paste_exp = _exp(getattr(p, "paste_expansion", None),
+                         getattr(fp, "paste_expansion", None))
+        half = min(p.w or 0.0, p.h or 0.0) / 2.0
+        if not getattr(fp, "paste", True):
+            # «Без пасты»: окно закрывается зазором заведомо больше
+            # половины площадки. Отдельного флага в скриптовом API нет,
+            # а этот приём -- штатный способ убрать пасту у площадки.
+            paste_exp = mm(-(half + 0.1))
+        elif _paste_grid(j, fp, p):
+            # Окно нарисовано сеткой на слое пасты -- собственное окно
+            # площадки закрываем, иначе они наложатся друг на друга.
+            paste_exp = mm(-(half + 0.1))
+        elif paste_exp != "" and half > 0:
+            # Слишком большой отрицательный зазор оставляет от окна
+            # ниточку: трафарет такого не режет, а Altium рисует вместо
+            # круга непонятную фигуру. Оставляем минимум MIN_PASTE и
+            # честно пишем об этом в отчёт.
+            val = float(paste_exp) / UNITS_PER_MM
+            left = 2.0 * half + 2.0 * val          # ширина окна пасты
+            if left < MIN_PASTE:
+                paste_exp = mm(-(half - MIN_PASTE / 2.0))
+                j.note(f"{fp.name}/{p.number}: зазор пасты {val:+.3f} мм "
+                       f"оставил бы окно {left:.3f} мм — это уже не окно; "
+                       f"ограничил до {MIN_PASTE:g} мм. Если паста не "
+                       f"нужна вовсе, снимите галочку «наносить пасту».")
+
         j.add("PAD", esc(p.number), mm(p.x), mm(p.y), mm(p.w), mm(p.h),
               PAD_SHAPE.get(p.shape, 2), deg10(p.rot), layer, mm(p.hole),
               1 if p.plated else 0, mm(p.hole_len),
-              deg10(getattr(p, "hole_rot", 0.0)))
+              deg10(p.slot_rot() if hasattr(p, "slot_rot")
+                    else getattr(p, "hole_rot", 0.0)),
+              _exp(getattr(p, "mask_expansion", None),
+                   getattr(fp, "mask_expansion", None)),
+              paste_exp)
+    # Окна маски и пасты Altium делает сам из площадок. Всё, что источник
+    # нарисовал на этих слоях, -- дубликат: у BGA из EasyEDA на каждый
+    # шарик лежит своя заливка, и в задании она превращалась в квадратную
+    # обводку вокруг площадки. Выбрасываем и говорим об этом в отчёте.
+    skipped_derived = sum(1 for pr in fp.prims if pr.layer in ("paste", "mask"))
+    if skipped_derived:
+        j.note(f"{fp.name}: убрал {skipped_derived} фигур со слоёв маски и "
+               f"пасты — Altium делает эти окна сам из площадок")
     for pr in fp.prims:
+        if pr.layer in ("paste", "mask"):
+            continue
         lay = FP_LAYER.get(pr.layer, 1)
         w = mm(pr.width or 0.15)
         if pr.kind == "line" and len(pr.pts) >= 2:
@@ -283,8 +382,18 @@ def _params_of(c: Component) -> List[tuple]:
     else:
         put("Value", c.value)
     put("Datasheet", c.datasheet)
+    # Свои параметры: у каждого может быть единица и признак «показывать
+    # на схеме». Единица приклеивается к значению -- в перечне элементов
+    # «2.5 А» читается, а «2.5» без единицы нет. Видимость по умолчанию
+    # выключена: параметр без заданного положения садится в начало
+    # координат компонента, и на листе получается вторая надпись, которую
+    # не сдвинуть; видимой должна быть одна -- Comment.
+    meta = getattr(c, "param_meta", None) or {}
     for k, v in (c.params or {}).items():
-        put(k, v)
+        m = meta.get(k) or {}
+        unit = str(m.get("unit", "") or "").strip()
+        val = f"{v} {unit}" if (unit and str(v).strip()) else v
+        put(k, val, 0 if m.get("visible") else 1)
     for fp in c.footprints:
         if fp.model and getattr(fp.model, "tape_rot", 0):
             put("УголВЛенте", f"{float(fp.model.tape_rot):g}")
@@ -326,8 +435,14 @@ def build_job(components: Sequence[Component], schlib: str, pcblib: str,
               vendor_libs: Optional[Iterable[str]] = None,
               fresh: bool = True, pin_hot_end: bool = False,
               ascii_only: bool = False, intlib: bool = False,
-              libpkg: str = "") -> str:
-    """Собрать текст задания."""
+              libpkg: str = "", notes: Optional[List[str]] = None) -> str:
+    """
+    Собрать текст задания.
+
+    `notes` -- список, куда дописываются замечания по ходу сборки
+    задания (например, обрезанный зазор пасты). В само задание они не
+    попадают, зато видны в логе GostLib до запуска Altium.
+    """
     global _ASCII_ONLY
     _ASCII_ONLY = ascii_only
     st = st or DEFAULT
@@ -377,6 +492,8 @@ def build_job(components: Sequence[Component], schlib: str, pcblib: str,
         n_c += 1
 
     j.add("END", n_c, n_fp)
+    if notes is not None:
+        notes.extend(j.notes)
     return j.text()
 
 
@@ -386,11 +503,12 @@ def write_job(path: str, components: Sequence[Component], schlib: str,
               vendor_libs: Optional[Iterable[str]] = None,
               fresh: bool = True, pin_hot_end: bool = False,
               ascii_only: bool = False, intlib: bool = False,
-              libpkg: str = "") -> str:
+              libpkg: str = "", notes: Optional[List[str]] = None) -> str:
     text = build_job(components, schlib, pcblib, st=st, log_path=log_path,
                      font=font, install=install, vendor_libs=vendor_libs,
                      fresh=fresh, pin_hot_end=pin_hot_end,
-                     ascii_only=ascii_only, intlib=intlib, libpkg=libpkg)
+                     ascii_only=ascii_only, intlib=intlib, libpkg=libpkg,
+                     notes=notes)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     enc = "ascii" if ascii_only else ENCODING
     with open(path, "w", encoding=enc, errors="replace",

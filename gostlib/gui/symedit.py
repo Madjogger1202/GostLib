@@ -13,15 +13,19 @@
 from __future__ import annotations
 
 import copy
-from typing import List, Optional, Tuple
+import math
+import os
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPen
-from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox,
+from PySide6.QtGui import (QBrush, QColor, QFont, QKeySequence,
+                           QPainter, QPen, QPolygonF)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
                                QDialog, QSplitter, QTreeWidget,
                                QTreeWidgetItem,
                                QDialogButtonBox, QHBoxLayout, QLabel, QMenu,
-                               QMessageBox, QPushButton, QSizePolicy, QSpinBox,
+                               QMessageBox, QPlainTextEdit, QPushButton,
+                               QSizePolicy, QSpinBox,
                                QVBoxLayout, QWidget)
 
 from ..gost import symbolgen
@@ -44,6 +48,169 @@ def _snap(v: float, g: int = GRID) -> int:
     return int(round(v / float(g)) * g)
 
 
+def _seg_dist(px: float, py: float, x1: float, y1: float,
+              x2: float, y2: float) -> float:
+    """Расстояние от точки до отрезка -- попадание мышью по контуру."""
+    dx, dy = x2 - x1, y2 - y1
+    d2 = dx * dx + dy * dy
+    if d2 <= 1e-9:
+        return math.hypot(px - x1, py - y1)
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / d2))
+    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+
+class PinPlanDialog(QDialog):
+    """
+    Раскладка выводов чужими руками: задание для ИИ и приём ответа.
+
+    Окно устроено в два поля намеренно. Слева -- задание, целиком готовое
+    к вставке в любой чат: правила ЕСКД, формат ответа и данные. Справа --
+    место под ответ. Раньше поле было одно, и человек либо затирал
+    задание ответом, либо вставлял ответ в конец задания.
+    """
+
+    def __init__(self, comp: Component, parent=None):
+        super().__init__(parent)
+        from ..pinplan import build_prompt
+
+        self.comp = comp
+        self.rows = None
+        self.datasheet = ""
+        self.original = build_prompt(comp)
+        self.setWindowTitle(f"ИИ-раскладка выводов — {comp.name}")
+
+        note = QLabel(
+            "1. «Копировать задание» → вставьте в любой чат с ИИ.  "
+            "2. Ответ вставьте справа.  3. «Проверить и применить».\n"
+            "Ответ принимается в CSV; забор из ``` и болтовню вокруг "
+            "таблицы разбор выбрасывает сам, колонки ищутся по именам в "
+            "шапке — их порядок не важен.")
+        note.setWordWrap(True)
+
+        self.edit = QPlainTextEdit(self.original)
+        self.answer = QPlainTextEdit()
+        self.answer.setPlaceholderText(
+            "Сюда — ответ ИИ.\n\n"
+            "number,name,etype,unit,side,group\n"
+            "1,VDD,power,1,L,PWR\n"
+            "2,GND,power,1,L,GND\n…")
+        for w in (self.edit, self.answer):
+            w.setFont(QFont("Consolas", 10))
+            w.setLineWrapMode(QPlainTextEdit.NoWrap)
+        panes = QSplitter(Qt.Horizontal)
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.addWidget(QLabel("Задание для ИИ"))
+        lv.addWidget(self.edit, 1)
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.addWidget(QLabel("Ответ ИИ"))
+        rv.addWidget(self.answer, 1)
+        panes.addWidget(left)
+        panes.addWidget(right)
+        panes.setSizes([600, 560])
+
+        copy_btn = QPushButton("Копировать задание")
+        copy_btn.setToolTip("Весь текст задания уйдёт в буфер обмена")
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(self.edit.toPlainText()))
+        ds_btn = QPushButton("Приложить datasheet…")
+        ds_btn.setToolTip(
+            "Из PDF берутся страницы с описанием выводов и добавляются в "
+            "задание.\nБез документации ИИ судит по одним номерам и "
+            "именам — с ней имена и группы получаются заметно точнее.")
+        ds_btn.clicked.connect(self._pick_datasheet)
+        paste_btn = QPushButton("Вставить ответ из буфера")
+        paste_btn.clicked.connect(
+            lambda: self.answer.setPlainText(QApplication.clipboard().text()))
+        restore_btn = QPushButton("Пересобрать задание")
+        restore_btn.clicked.connect(self._rebuild)
+        apply_btn = QPushButton("Проверить и применить")
+        apply_btn.setDefault(True)
+        apply_btn.clicked.connect(self._validate)
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.clicked.connect(self.reject)
+
+        self.status = QLabel("")
+        self.status.setStyleSheet("color:#888;")
+        self.cb_tidy = QCheckBox("привести в порядок после ИИ")
+        self.cb_tidy.setChecked(True)
+        self.cb_tidy.setToolTip(
+            "Разнести питание и землю по своим секциям, выровнять стороны\n"
+            "и разбить слишком длинные столбики. Модель этого не умеет: она\n"
+            "не знает ни размера листа, ни того, что у BGA бывает двести\n"
+            "пятьдесят земель. Классификация остаётся её, компоновка — наша.")
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.cb_tidy)
+        buttons.addWidget(copy_btn)
+        buttons.addWidget(ds_btn)
+        buttons.addWidget(paste_btn)
+        buttons.addWidget(restore_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(apply_btn)
+        buttons.addWidget(cancel_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(note)
+        layout.addWidget(panes, 1)
+        layout.addWidget(self.status)
+        layout.addLayout(buttons)
+        from .widgets import allow_narrow, fit_to_screen
+        allow_narrow(self)
+        fit_to_screen(self, 1180, 760)
+
+    def _rebuild(self):
+        from ..pinplan import build_prompt
+        self.edit.setPlainText(build_prompt(self.comp, self.datasheet))
+
+    def _pick_datasheet(self):
+        from PySide6.QtWidgets import QFileDialog
+        from ..pinplan import datasheet_text
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Документация на компонент", "", "PDF (*.pdf)")
+        if not path:
+            return
+        try:
+            self.datasheet = datasheet_text(path)
+        except Exception as exc:                            # noqa: BLE001
+            QMessageBox.warning(self, "Документация не прочиталась", str(exc))
+            return
+        self._rebuild()
+        self.status.setText(
+            f"К заданию добавлено {len(self.datasheet)} знаков из "
+            f"{os.path.basename(path)}")
+
+    def _validate(self):
+        from ..pinplan import PinPlanError, parse_plan, tidy
+
+        text = self.answer.toPlainText().strip()
+        if not text:
+            QMessageBox.information(
+                self, "Пусто",
+                "Вставьте ответ ИИ в правое поле.")
+            return
+        try:
+            rows = parse_plan(text, self.comp.raw_pins or self.comp.symbol.pins)
+        except PinPlanError as exc:
+            QMessageBox.warning(self, "Раскладка не применена", str(exc))
+            return
+        # Классификацию сделала модель, компоновку доводим сами: ни одна
+        # модель не знает, что двести пятьдесят земель в один столбик --
+        # это два листа A3 в высоту.
+        if self.cb_tidy.isChecked():
+            rows, notes = tidy(rows)
+            if notes:
+                QMessageBox.information(
+                    self, "Раскладка приведена в порядок",
+                    "Что поправлено после ИИ:\n\n  • "
+                    + "\n  • ".join(notes[:10]))
+        self.rows = rows
+        self.accept()
+
+
 class Canvas(QWidget):
     """Холст: корпус, поля, разделители и выводы. Всё таскается мышью."""
 
@@ -61,11 +228,19 @@ class Canvas(QWidget):
         self.sel: List[SymPin] = []       # выделенные выводы
         self.sel_lines: List[int] = []    # индексы выделенных линий
         self.rubber = None                # рамка выделения (x1,y1,x2,y2) в милах
-        self.line_mode = False            # режим рисования линии
-        self.rect_mode = False            # режим рисования прямоугольника
+        # Инструмент рисования: '' -- обычная работа мышью, иначе
+        # 'line' | 'rect' | 'circle' | 'arc' | 'poly'. Раньше это были два
+        # отдельных флага; с пятью фигурами так уже нельзя.
+        self.tool = ""
         self._line_start = None
         self._line_cur = None
+        self._poly_pts: List[Tuple[float, float]] = []   # набор ломаной
+        self._drag_from = (0.0, 0.0)      # точка нажатия при таскании фигур
+        self._drag_orig: Dict[int, List[List[float]]] = {}
+        self.sel_shapes: List[int] = []   # индексы выделенных фигур
+        self.snap_ends = True             # прилипать к концам линий и выводам
         self.clip: List[List[int]] = []   # буфер обмена линий
+        self.clip_shapes: List[Dict] = []  # буфер обмена фигур
         # что разрешено выделять мышью: иначе при рисовании и рамке
         # цепляешь то выводы, то графику
         self.pick_pins = True
@@ -85,6 +260,30 @@ class Canvas(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._menu)
+
+    # --------------------------------------------------------- шрифт --------
+    def _text_font(self, size_pt: float) -> QFont:
+        """
+        Шрифт для текста символа В МИРОВЫХ единицах.
+
+        Раньше кегль здесь считался от масштаба экрана («Segoe UI» размером
+        `size * 1.2 * zoom`), то есть к тому, что получится в Altium, не
+        имел отношения вовсе: при разном зуме подписи занимали разную долю
+        корпуса, и подогнать их на глаз было невозможно.
+
+        Теперь высота считается так же, как в превью и в задании: кегль в
+        пунктах -> милы -> пиксели экрана через текущий зум. Множитель
+        `preview_font_scale` -- поправка на то, что Altium отмеряет текст
+        по высоте прописной буквы, а Qt и SVG -- по полной высоте кегля.
+        """
+        from ..gost.style import PT2MIL
+        k = float(getattr(self.st, "preview_font_scale", 0) or 0.72)
+        px = float(size_pt) * PT2MIL * k * self.zoom
+        f = QFont(self.st.font or "GOST type B")
+        # ниже шести пикселей Qt рисует кашу -- на мелком зуме подпись
+        # перестаёт быть пропорциональной, зато остаётся читаемой
+        f.setPixelSize(max(6, int(round(px))))
+        return f
 
     # ------------------------------------------------------- геометрия ------
     @property
@@ -230,12 +429,115 @@ class Canvas(QWidget):
                 best, bd = i, d
         return best
 
+    # ------------------------------------------------------- фигуры ---------
+    @property
+    def shapes(self) -> List[Dict]:
+        """Фигуры текущей секции (дуги, окружности, полигоны)."""
+        return self.g.user_shapes
+
+    @property
+    def line_mode(self) -> bool:
+        return self.tool == "line"
+
+    @property
+    def rect_mode(self) -> bool:
+        return self.tool == "rect"
+
+    # Кому сообщить, что инструмент сменился (Esc на холсте тоже его
+    # выключает, и кнопки в панели должны отжаться сами).
+    on_tool_change = None
+
+    def set_tool(self, name: str):
+        """Включить инструмент рисования; повторное нажатие выключает."""
+        self.tool = "" if self.tool == name else name
+        self._line_start = self._line_cur = None
+        self._poly_pts = []
+        if callable(self.on_tool_change):
+            self.on_tool_change(self.tool)
+        self.update()
+
+    def _snap_pt(self, wx: float, wy: float) -> Tuple[int, int]:
+        """
+        Точка с привязкой: сначала к концам уже нарисованного, потом к
+        сетке. Без прилипания к концам фигуры не стыкуются: на глаз в
+        милах не попасть, а щель в пару милов в Altium видно.
+        """
+        if self.snap_ends:
+            tol = self._tol(10)
+            best, bd = None, tol
+            for ln in self.g.user_lines:
+                for px, py in ((ln[0], ln[1]), (ln[2], ln[3])):
+                    d = math.hypot(px - wx, py - wy)
+                    if d < bd:
+                        best, bd = (px, py), d
+            for sh in self.shapes:
+                for p_ in (sh.get("pts") or []):
+                    d = math.hypot(p_[0] - wx, p_[1] - wy)
+                    if d < bd:
+                        best, bd = (p_[0], p_[1]), d
+            for pin in self.visible_pins():
+                d = math.hypot(pin.x - wx, pin.y - wy)
+                if d < bd:
+                    best, bd = (pin.x, pin.y), d
+            if best:
+                return int(round(best[0])), int(round(best[1]))
+        return _snap(wx, self.grid), _snap(wy, self.grid)
+
+    def shape_points(self, sh: Dict) -> List[Tuple[float, float]]:
+        """Ломаная, которой фигура рисуется и проверяется на попадание."""
+        kind = sh.get("kind")
+        pts = [(float(p[0]), float(p[1])) for p in (sh.get("pts") or [])]
+        if kind == "rect" and len(pts) >= 2:
+            (x1, y1), (x2, y2) = pts[0], pts[1]
+            return [(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)]
+        if kind in ("circle", "arc") and pts:
+            cx, cy = pts[0]
+            r = float(sh.get("r", 0) or 0)
+            a1 = math.radians(float(sh.get("a1", 0.0)))
+            a2 = math.radians(float(sh.get("a2", 360.0))
+                              if kind == "arc" else 360.0)
+            n = max(12, int(abs(a2 - a1) / math.pi * 24))
+            return [(cx + r * math.cos(a1 + (a2 - a1) * i / n),
+                     cy + r * math.sin(a1 + (a2 - a1) * i / n))
+                    for i in range(n + 1)]
+        if kind == "poly" and pts:
+            return pts + ([pts[0]] if sh.get("close") and len(pts) > 2 else [])
+        return pts
+
+    def _shape_at(self, wx: float, wy: float) -> int:
+        """Индекс фигуры под курсором (по контуру), иначе -1."""
+        tol = self._tol(10)
+        best, bd = -1, tol
+        for i, sh in enumerate(self.shapes):
+            pts = self.shape_points(sh)
+            for a, b in zip(pts, pts[1:]):
+                d = _seg_dist(wx, wy, a[0], a[1], b[0], b[1])
+                if d < bd:
+                    best, bd = i, d
+        return best
+
+    def move_shape(self, i: int, dx: float, dy: float):
+        sh = self.shapes[i]
+        sh["pts"] = [[p[0] + dx, p[1] + dy] for p in (sh.get("pts") or [])]
+
+    def shape_box(self, sh: Dict):
+        pts = self.shape_points(sh)
+        if not pts:
+            return None
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+
     def mousePressEvent(self, e):
         wx, wy = self.to_world(e.position())
         self._last = e.position()
-        if (self.line_mode or self.rect_mode) and e.button() == Qt.LeftButton:
+        if self.tool == "poly" and e.button() == Qt.LeftButton:
+            self._poly_pts.append(self._snap_pt(wx, wy))
+            self.update()
+            return
+        if self.tool and self.tool != "poly" and e.button() == Qt.LeftButton:
             # нажал -- потянул -- отпустил; обе точки прилипают к сетке
-            self._line_start = (_snap(wx, self.grid), _snap(wy, self.grid))
+            self._line_start = self._snap_pt(wx, wy)
             self._line_cur = self._line_start
             self.grab = ("newline",)
             self.update()
@@ -264,6 +566,23 @@ class Canvas(QWidget):
             self.grab = ("h",)
             return
         add = bool(e.modifiers() & Qt.ControlModifier)
+        si = self._shape_at(wx, wy) if self.pick_lines else -1
+        if si >= 0:
+            if add:
+                if si in self.sel_shapes:
+                    self.sel_shapes.remove(si)
+                else:
+                    self.sel_shapes.append(si)
+            elif si not in self.sel_shapes:
+                self.sel_shapes = [si]
+                self.sel, self.sel_lines = [], []
+            self._drag_from = (wx, wy)
+            self._drag_orig = {
+                j: [list(p) for p in (self.shapes[j].get("pts") or [])]
+                for j in (self.sel_shapes if si in self.sel_shapes else [si])
+                if 0 <= j < len(self.shapes)}
+            self.grab = ("shape", si)
+            return
         li = self._line_at(wx, wy)
         if li >= 0:
             if add:
@@ -273,7 +592,7 @@ class Canvas(QWidget):
                     self.sel_lines.append(li)
             elif li not in self.sel_lines:
                 self.sel_lines = [li]
-                self.sel = []
+                self.sel, self.sel_shapes = [], []
             self.grab = ("line", li)
             return
         p = self._pin_at(wx, wy)
@@ -302,7 +621,19 @@ class Canvas(QWidget):
             return
         kind = self.grab[0]
         if kind == "newline":
-            self._line_cur = (_snap(wx, self.grid), _snap(wy, self.grid))
+            self._line_cur = self._snap_pt(wx, wy)
+        elif kind == "shape":
+            # Смещение считаем ОТ ТОЧКИ НАЖАТИЯ, а не от предыдущего
+            # кадра: если округлять каждый шаг мыши к сетке, движения
+            # меньше шага теряются и фигура ползёт медленнее курсора.
+            i = self.grab[1]
+            ox, oy = self._drag_from
+            dx = _snap(wx - ox, self.grid)
+            dy = _snap(wy - oy, self.grid)
+            for j, orig in self._drag_orig.items():
+                if 0 <= j < len(self.shapes):
+                    self.shapes[j]["pts"] = [[p[0] + dx, p[1] + dy]
+                                             for p in orig]
         elif kind == "pan":
             d = e.position() - self._last
             self.pan[0] += d.x()
@@ -359,22 +690,60 @@ class Canvas(QWidget):
             self.g.body_h = max(200, _snap(-wy, self.grid))
         self.update()
 
+    def add_shape(self, kind: str, **kw) -> int:
+        """Добавить фигуру текущей секции и вернуть её индекс."""
+        sh = {"kind": kind, "w": self.new_w, "col": self.new_col}
+        sh.update(kw)
+        self.shapes.append(sh)
+        return len(self.shapes) - 1
+
+    def finish_poly(self):
+        """Закончить набор ломаной (двойной клик, Enter или ПКМ)."""
+        pts = [list(p) for p in self._poly_pts]
+        self._poly_pts = []
+        if len(pts) >= 2:
+            i = self.add_shape("poly", pts=pts, close=0, fill=0)
+            self.sel_shapes = [i]
+        self.update()
+
+    def mouseDoubleClickEvent(self, e):
+        if self.tool == "poly":
+            self.finish_poly()
+            return
+        super().mouseDoubleClickEvent(e)
+
     def mouseReleaseEvent(self, _e):
         if self.grab and self.grab[0] == "newline":
             a, b = self._line_start, self._line_cur
             if a and b and a != b:
-                if self.rect_mode:
+                x1, y1, x2, y2 = a[0], a[1], b[0], b[1]
+                if self.tool == "rect":
                     # прямоугольник -- четыре обычные линии: дальше их
                     # можно двигать и править поодиночке
-                    x1, y1, x2, y2 = a[0], a[1], b[0], b[1]
                     for sg in ((x1, y1, x2, y1), (x2, y1, x2, y2),
                                (x2, y2, x1, y2), (x1, y2, x1, y1)):
                         self.g.user_lines.append(
                             [sg[0], sg[1], sg[2], sg[3],
                              self.new_w, self.new_col])
+                elif self.tool in ("circle", "arc"):
+                    # тянем от центра к краю: радиус -- длина протяжки,
+                    # округлённая к сетке, иначе окружность не сядет на
+                    # координаты выводов
+                    r = _snap(math.hypot(x2 - x1, y2 - y1), self.grid)
+                    if r >= self.grid:
+                        if self.tool == "circle":
+                            i = self.add_shape("circle", pts=[[x1, y1]], r=r,
+                                               fill=0)
+                        else:
+                            # дуга по умолчанию верхняя половина: углы
+                            # правятся в панели, там же их видно числом
+                            i = self.add_shape("arc", pts=[[x1, y1]], r=r,
+                                               a1=0.0, a2=180.0)
+                        self.sel_shapes = [i]
+                        self.sel, self.sel_lines = [], []
                 else:
-                    self.g.user_lines.append([a[0], a[1], b[0], b[1],
-                                                self.new_w, self.new_col])
+                    self.g.user_lines.append([x1, y1, x2, y2,
+                                              self.new_w, self.new_col])
             self._line_start = self._line_cur = None
             self.grab = None
             self.update()
@@ -393,36 +762,76 @@ class Canvas(QWidget):
                     i for i, ln in enumerate(self.g.user_lines)
                     if lo_y <= ln[1] <= hi_y and lo_y <= ln[3] <= hi_y
                 ] if self.pick_lines else []
+                self.sel_shapes = [] if not self.pick_lines else [
+                    i for i, sh in enumerate(self.shapes)
+                    if (lambda bx: bx and lo_x <= bx[0] and bx[2] <= hi_x
+                        and lo_y <= bx[1] and bx[3] <= hi_y)(
+                            self.shape_box(sh))]
             else:
-                self.sel, self.sel_lines = [], []
+                self.sel, self.sel_lines, self.sel_shapes = [], [], []
         self.rubber = None
         self.grab = None
         self.update()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape:
-            self.line_mode = False
-            self.rect_mode = False
+            self.tool = ""
             self._line_start = None
-            self.sel, self.sel_lines = [], []
+            self._poly_pts = []
+            self.sel, self.sel_lines, self.sel_shapes = [], [], []
+            if callable(self.on_tool_change):
+                self.on_tool_change("")
+        elif e.key() in (Qt.Key_Return, Qt.Key_Enter) and self._poly_pts:
+            self.finish_poly()
+            return
         elif e.key() == Qt.Key_Delete:
             for j in sorted(self.sel_lines, reverse=True):
                 if 0 <= j < len(self.g.user_lines):
                     del self.g.user_lines[j]
             self.sel_lines = []
+            for j in sorted(self.sel_shapes, reverse=True):
+                if 0 <= j < len(self.shapes):
+                    del self.shapes[j]
+            self.sel_shapes = []
         elif e.matches(QKeySequence.Copy):
             self.clip = [list(self.g.user_lines[j]) for j in self.sel_lines
                          if 0 <= j < len(self.g.user_lines)]
+            self.clip_shapes = [copy.deepcopy(self.shapes[j])
+                                for j in self.sel_shapes
+                                if 0 <= j < len(self.shapes)]
         elif e.matches(QKeySequence.Paste):
-            base = len(self.g.user_lines)
-            for ln in self.clip:
-                self.g.user_lines.append([ln[0], ln[1] - GRID,
-                                            ln[2], ln[3] - GRID])
-            self.sel_lines = list(range(base, len(self.g.user_lines)))
+            self._paste(GRID)
+        elif e.key() == Qt.Key_D and (e.modifiers() & Qt.ControlModifier):
+            # дубликат выделенного рядом -- быстрее, чем копировать и
+            # вставлять двумя горячими клавишами
+            self.clip = [list(self.g.user_lines[j]) for j in self.sel_lines
+                         if 0 <= j < len(self.g.user_lines)]
+            self.clip_shapes = [copy.deepcopy(self.shapes[j])
+                                for j in self.sel_shapes
+                                if 0 <= j < len(self.shapes)]
+            self._paste(GRID)
         elif e.key() == Qt.Key_L:
-            self.line_mode = not self.line_mode
-            self._line_start = None
+            self.set_tool("line")
+            return
         self.update()
+
+    def _paste(self, off: int):
+        """Вставить линии и фигуры из буфера со сдвигом на шаг сетки."""
+        base = len(self.g.user_lines)
+        for ln in self.clip:
+            row = list(ln)
+            while len(row) < 6:
+                row.append(1 if len(row) == 4 else -1)
+            row[1] -= off
+            row[3] -= off
+            self.g.user_lines.append(row)
+        self.sel_lines = list(range(base, len(self.g.user_lines)))
+        base_s = len(self.shapes)
+        for sh in self.clip_shapes:
+            cp = copy.deepcopy(sh)
+            cp["pts"] = [[p[0], p[1] - off] for p in (cp.get("pts") or [])]
+            self.shapes.append(cp)
+        self.sel_shapes = list(range(base_s, len(self.shapes)))
 
     def _menu(self, pos):
         wx, wy = self.to_world(QPointF(pos))
@@ -583,9 +992,7 @@ class Canvas(QWidget):
                     span = float(pr.a2) - a1
                     p.drawArc(box, int(a1 * 16), int(span * 16))
             elif pr.kind == "text" and pr.pts:
-                f = QFont("Segoe UI",
-                          max(5, int(pr.size * 1.2 * min(2.5, self.zoom * 4))))
-                p.setFont(f)
+                p.setFont(self._text_font(pr.size))
                 x, y = pr.pts[0]
                 pt = self.to_screen(x, y)
                 w = p.fontMetrics().horizontalAdvance(pr.text or "")
@@ -594,6 +1001,46 @@ class Canvas(QWidget):
                 elif int(pr.justify) == 2:
                     pt = QPointF(pt.x() - w, pt.y())
                 p.drawText(pt, pr.text or "")
+
+    def _draw_shapes(self, p: QPainter):
+        """Дуги, окружности и полигоны редактора."""
+        for i, sh in enumerate(self.shapes):
+            sel = i in self.sel_shapes
+            w = int(sh.get("w", 1) or 1)
+            pen = QPen(QColor("#c02020") if sel
+                       else _qcolor(int(sh.get("col", -1))),
+                       (3 if sel else 1) + w)
+            p.setPen(pen)
+            if sh.get("fill"):
+                c = _qcolor(int(sh.get("col", -1)))
+                c.setAlpha(60)
+                p.setBrush(QBrush(c))
+            else:
+                p.setBrush(Qt.NoBrush)
+            kind = sh.get("kind")
+            pts = sh.get("pts") or []
+            if kind in ("circle", "arc") and pts:
+                cx, cy = pts[0][0], pts[0][1]
+                r = float(sh.get("r", 0) or 0)
+                box = QRectF(self.to_screen(cx - r, cy + r),
+                             self.to_screen(cx + r, cy - r))
+                if kind == "circle":
+                    p.drawEllipse(box)
+                else:
+                    a1 = float(sh.get("a1", 0.0))
+                    p.drawArc(box, int(a1 * 16),
+                              int((float(sh.get("a2", 360.0)) - a1) * 16))
+            elif kind == "rect" and len(pts) >= 2:
+                p.drawRect(QRectF(self.to_screen(pts[0][0], pts[0][1]),
+                                  self.to_screen(pts[1][0], pts[1][1])))
+            elif kind == "poly" and len(pts) >= 2:
+                poly = QPolygonF([self.to_screen(q[0], q[1])
+                                  for q in self.shape_points(sh)])
+                if sh.get("fill") and sh.get("close"):
+                    p.drawPolygon(poly)
+                else:
+                    p.drawPolyline(poly)
+            p.setBrush(Qt.NoBrush)
 
     def explode_prims(self):
         """
@@ -641,6 +1088,201 @@ class Canvas(QWidget):
         self.update()
         return added
 
+    # -------------------------------------------- выравнивание и стиль ------
+    def _sel_objects(self):
+        """
+        Выделенное как список «объектов» с общим интерфейсом.
+
+        Каждый элемент -- (габарит, функция сдвига). Так одна и та же
+        математика выравнивания работает и для выводов, и для линий, и
+        для фигур: иначе пришлось бы писать три почти одинаковых куска.
+        """
+        out = []
+        for pin in self.sel:
+            def mv(dx, dy, p=pin):
+                p.manual = True
+                p.x = int(round(p.x + dx))
+                p.y = int(round(p.y + dy))
+            out.append(((pin.x, pin.y, pin.x, pin.y), mv))
+        for j in self.sel_lines:
+            if not (0 <= j < len(self.g.user_lines)):
+                continue
+            ln = self.g.user_lines[j]
+
+            def mvl(dx, dy, l=ln):
+                l[0] += dx
+                l[1] += dy
+                l[2] += dx
+                l[3] += dy
+            out.append(((min(ln[0], ln[2]), min(ln[1], ln[3]),
+                         max(ln[0], ln[2]), max(ln[1], ln[3])), mvl))
+        for j in self.sel_shapes:
+            if not (0 <= j < len(self.shapes)):
+                continue
+            box = self.shape_box(self.shapes[j])
+            if not box:
+                continue
+
+            def mvs(dx, dy, k=j):
+                self.move_shape(k, dx, dy)
+            out.append((box, mvs))
+        return out
+
+    def align(self, how: str) -> int:
+        """
+        Выровнять выделенное: left|right|top|bottom|cx|cy.
+
+        Ровняем по крайнему объекту выделения (как в любом векторном
+        редакторе), координаты остаются на сетке.
+        """
+        objs = self._sel_objects()
+        if len(objs) < 2:
+            return 0
+        xs1 = [o[0][0] for o in objs]
+        ys1 = [o[0][1] for o in objs]
+        xs2 = [o[0][2] for o in objs]
+        ys2 = [o[0][3] for o in objs]
+        for (x1, y1, x2, y2), mv in objs:
+            dx = dy = 0.0
+            if how == "left":
+                dx = min(xs1) - x1
+            elif how == "right":
+                dx = max(xs2) - x2
+            elif how == "top":
+                dy = max(ys2) - y2
+            elif how == "bottom":
+                dy = min(ys1) - y1
+            elif how == "cx":
+                dx = (min(xs1) + max(xs2)) / 2.0 - (x1 + x2) / 2.0
+            elif how == "cy":
+                dy = (min(ys1) + max(ys2)) / 2.0 - (y1 + y2) / 2.0
+            if dx or dy:
+                mv(_snap(dx, self.grid) if how in ("left", "right") else dx,
+                   _snap(dy, self.grid) if how in ("top", "bottom") else dy)
+        self.update()
+        return len(objs)
+
+    def distribute(self, axis: str) -> int:
+        """Разложить выделенное с равными промежутками по X или по Y."""
+        objs = self._sel_objects()
+        if len(objs) < 3:
+            return 0
+        k = 0 if axis == "x" else 1
+        objs.sort(key=lambda o: (o[0][k] + o[0][k + 2]) / 2.0)
+        first = (objs[0][0][k] + objs[0][0][k + 2]) / 2.0
+        last = (objs[-1][0][k] + objs[-1][0][k + 2]) / 2.0
+        step = (last - first) / (len(objs) - 1)
+        for i, ((x1, y1, x2, y2), mv) in enumerate(objs):
+            want = first + step * i
+            cur = ((x1 + x2) / 2.0) if axis == "x" else ((y1 + y2) / 2.0)
+            d = _snap(want - cur, self.grid)
+            if d:
+                mv(d, 0) if axis == "x" else mv(0, d)
+        self.update()
+        return len(objs)
+
+    def copy_style(self) -> int:
+        """
+        Стиль первого выделенного объекта -- всем остальным выделенным.
+
+        Первым считается объект, выбранный раньше: в списках выделения
+        порядок как раз такой.
+        """
+        src = None
+        if self.sel_lines:
+            ln = self.g.user_lines[self.sel_lines[0]]
+            src = (int(ln[4]) if len(ln) > 4 else 1,
+                   int(ln[5]) if len(ln) > 5 else -1)
+        elif self.sel_shapes:
+            sh = self.shapes[self.sel_shapes[0]]
+            src = (int(sh.get("w", 1) or 1), int(sh.get("col", -1)))
+        if not src:
+            return 0
+        w, col = src
+        n = 0
+        for j in self.sel_lines[1:]:
+            ln = self.g.user_lines[j]
+            while len(ln) < 6:
+                ln.append(1 if len(ln) == 4 else -1)
+            ln[4], ln[5] = w, col
+            n += 1
+        for j in self.sel_shapes if self.sel_lines else self.sel_shapes[1:]:
+            self.shapes[j]["w"] = w
+            self.shapes[j]["col"] = col
+            n += 1
+        self.new_w, self.new_col = w, col
+        self.update()
+        return n
+
+    def set_arc_angles(self, a1: float, a2: float) -> int:
+        """Углы выделенных дуг (в градусах, против часовой)."""
+        n = 0
+        for j in self.sel_shapes:
+            if 0 <= j < len(self.shapes) and self.shapes[j].get("kind") == "arc":
+                self.shapes[j]["a1"] = float(a1)
+                self.shapes[j]["a2"] = float(a2)
+                n += 1
+        self.update()
+        return n
+
+    def toggle_fill(self) -> int:
+        """Заливка у выделенных фигур (у окружности и замкнутой ломаной)."""
+        n = 0
+        for j in self.sel_shapes:
+            if 0 <= j < len(self.shapes):
+                sh = self.shapes[j]
+                sh["fill"] = 0 if sh.get("fill") else 1
+                if sh.get("kind") == "poly":
+                    sh["close"] = 1
+                n += 1
+        self.update()
+        return n
+
+    def rotate_selection(self, deg: float = 90.0) -> int:
+        """Повернуть выделенные линии и фигуры вокруг центра выделения."""
+        objs = self._sel_objects()
+        if not objs:
+            return 0
+        xs = [v for o in objs for v in (o[0][0], o[0][2])]
+        ys = [v for o in objs for v in (o[0][1], o[0][3])]
+        cx, cy = (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+        a = math.radians(deg)
+        ca, sa = math.cos(a), math.sin(a)
+
+        def rot(x, y):
+            dx, dy = x - cx, y - cy
+            return (_snap(cx + dx * ca - dy * sa, self.grid),
+                    _snap(cy + dx * sa + dy * ca, self.grid))
+
+        n = 0
+        for j in self.sel_lines:
+            if not (0 <= j < len(self.g.user_lines)):
+                continue
+            ln = self.g.user_lines[j]
+            ln[0], ln[1] = rot(ln[0], ln[1])
+            ln[2], ln[3] = rot(ln[2], ln[3])
+            n += 1
+        for j in self.sel_shapes:
+            if not (0 <= j < len(self.shapes)):
+                continue
+            sh = self.shapes[j]
+            if sh.get("kind") == "rect" and len(sh.get("pts") or []) >= 2:
+                # Повёрнутый прямоугольник Altium не умеет: разворачиваем
+                # его в ломаную ДО поворота, иначе после поворота углы
+                # снова сложились бы в осевой прямоугольник и поворот
+                # молча пропал бы.
+                (x1, y1), (x2, y2) = sh["pts"][0], sh["pts"][1]
+                sh["kind"] = "poly"
+                sh["close"] = 1
+                sh["pts"] = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+            sh["pts"] = [list(rot(p[0], p[1])) for p in (sh.get("pts") or [])]
+            if sh.get("kind") == "arc":
+                sh["a1"] = float(sh.get("a1", 0.0)) + deg
+                sh["a2"] = float(sh.get("a2", 360.0)) + deg
+            n += 1
+        self.update()
+        return n
+
     def set_line_style(self, width: Optional[int] = None,
                        color: Optional[int] = None):
         """Толщина и цвет выделенных линий (или будущих, если ничего нет)."""
@@ -658,6 +1300,13 @@ class Canvas(QWidget):
                 ln[4] = int(width)
             if color is not None:
                 ln[5] = int(color)
+        for j in self.sel_shapes:
+            if not (0 <= j < len(self.shapes)):
+                continue
+            if width is not None:
+                self.shapes[j]["w"] = int(width)
+            if color is not None:
+                self.shapes[j]["col"] = int(color)
         self.update()
 
     def paintEvent(self, _e):
@@ -711,10 +1360,14 @@ class Canvas(QWidget):
                           (3 if i in self.sel_lines else 1) + w))
             p.drawLine(self.to_screen(ln[0], ln[1]),
                        self.to_screen(ln[2], ln[3]))
+        self._draw_shapes(p)
 
-        # выводы
-        f = QFont("Segoe UI", max(6, int(9 * min(2.0, self.zoom * 4))))
-        p.setFont(f)
+        # Выводы. Имена и номера редактор рисует сам (сгенерированные
+        # подписи из графики отфильтрованы), поэтому кегль берём тот же,
+        # что уйдёт в Altium, -- иначе в редакторе подписи выглядят одного
+        # размера, а на схеме другого.
+        f_num = self._text_font(self.st.size_pin_num)
+        f_name = self._text_font(self.st.size_pin)
         for pin in self.visible_pins():
             out = -1 if pin.side == "L" else 1
             x2 = pin.x + out * (pin.length or self.st.pin_length)
@@ -723,9 +1376,11 @@ class Canvas(QWidget):
                           3 if sel else 1.5))
             p.drawLine(self.to_screen(pin.x, pin.y), self.to_screen(x2, pin.y))
             p.setPen(QColor("#606060"))
+            p.setFont(f_num)
             n = self.to_screen((pin.x + x2) / 2.0, pin.y + 30)
             p.drawText(n, pin.number or "")
             p.setPen(QColor("#000000"))
+            p.setFont(f_name)
             tx = self.to_screen(pin.x + out * -1 * 60, pin.y - 30)
             if pin.side == "L":
                 p.drawText(tx, pin.name or "")
@@ -741,27 +1396,42 @@ class Canvas(QWidget):
             p.setBrush(Qt.NoBrush)
         if self._line_start and self._line_cur:
             p.setPen(QPen(QColor("#c02020"), 2, Qt.DashLine))
-            if self.rect_mode:
-                p.setBrush(Qt.NoBrush)
-                p.drawRect(QRectF(self.to_screen(*self._line_start),
-                                  self.to_screen(*self._line_cur)))
+            p.setBrush(Qt.NoBrush)
+            a, b = self._line_start, self._line_cur
+            if self.tool == "rect":
+                p.drawRect(QRectF(self.to_screen(*a), self.to_screen(*b)))
+            elif self.tool in ("circle", "arc"):
+                r = math.hypot(b[0] - a[0], b[1] - a[1])
+                box = QRectF(self.to_screen(a[0] - r, a[1] + r),
+                             self.to_screen(a[0] + r, a[1] - r))
+                if self.tool == "circle":
+                    p.drawEllipse(box)
+                else:
+                    p.drawArc(box, 0, 180 * 16)
+                p.drawLine(self.to_screen(*a), self.to_screen(*b))
             else:
-                p.drawLine(self.to_screen(*self._line_start),
-                           self.to_screen(*self._line_cur))
-        if self.line_mode or self.rect_mode:
+                p.drawLine(self.to_screen(*a), self.to_screen(*b))
+        if self._poly_pts:
+            p.setPen(QPen(QColor("#c02020"), 2, Qt.DashLine))
+            p.drawPolyline(QPolygonF([self.to_screen(q[0], q[1])
+                                      for q in self._poly_pts]))
+        if self.tool:
+            hint = {"line": "линия", "rect": "прямоугольник",
+                    "circle": "окружность: от центра к краю",
+                    "arc": "дуга: от центра к краю, углы — в панели",
+                    "poly": "ломаная: клики по вершинам, "
+                            "двойной клик или Enter — закончить",
+                    }.get(self.tool, self.tool)
             p.setPen(QColor("#c02020"))
-            p.drawText(8, 18,
-                       ("режим прямоугольника" if self.rect_mode
-                        else "режим линии")
-                       + ": зажмите ЛКМ и протяните, Esc — выйти")
+            p.drawText(8, 18, f"{hint};  Esc — выйти")
         p.setPen(QColor("#888"))
         mm = 0.0254
         p.drawText(8, self.height() - 8,
-                   f"выделено выводов {len(self.sel)}, линий "
-                   f"{len(self.sel_lines)}   корпус "
-                   f"{W * mm:.2f}×{H * mm:.2f} мм   "
+                   f"выделено: выводов {len(self.sel)}, линий "
+                   f"{len(self.sel_lines)}, фигур {len(self.sel_shapes)}   "
+                   f"корпус {W * mm:.2f}×{H * mm:.2f} мм   "
                    "ЛКМ — выбор и перетаскивание, Ctrl — добавить, "
-                   "рамка — группа, L — линия, Del — удалить, Ctrl+C/V")
+                   "рамка — группа, Del — удалить, Ctrl+C/V, Ctrl+D — дубль")
 
 
 class SymbolEditor(QDialog):
@@ -769,8 +1439,8 @@ class SymbolEditor(QDialog):
 
     def __init__(self, comp: Component, st: Style, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Редактирование УГО — {comp.name}")
-        self.resize(1000, 720)
+        self._title = f"Редактирование УГО — {comp.name}"
+        self.setWindowTitle(self._title)
         self.comp = copy.deepcopy(comp)
         self.st = st
         sym = self.comp.symbol
@@ -793,6 +1463,7 @@ class SymbolEditor(QDialog):
                 g.field_l, g.field_r = fl, fr
 
         self.canvas = Canvas(self.comp, st)
+        self.canvas.on_tool_change = lambda t: self._sync_tools(t)
 
         self.cb_auto = QCheckBox("подгонять корпус под выводы")
         self.cb_auto.setChecked(True)
@@ -844,20 +1515,32 @@ class SymbolEditor(QDialog):
         bar = QHBoxLayout()
         bar.addWidget(QLabel("шаг:"))
         bar.addWidget(self.sp_pitch)
-        self.btn_line = QPushButton("Линия (L)")
-        self.btn_line.setCheckable(True)
-        self.btn_line.setToolTip("Нарисовать свою линию: клик — начало, "
-                                 "клик — конец. Линии выделяются, таскаются, "
-                                 "копируются Ctrl+C / Ctrl+V, удаляются Del.")
-        self.btn_line.clicked.connect(self._line_mode)
-        bar.addWidget(self.btn_line)
-        self.btn_rect = QPushButton("Прямоугольник")
-        self.btn_rect.setCheckable(True)
-        self.btn_rect.setToolTip(
-            "Нарисовать рамку: она станет четырьмя обычными линиями, "
-            "каждую можно двигать и править отдельно.")
-        self.btn_rect.clicked.connect(self._rect_mode)
-        bar.addWidget(self.btn_rect)
+        # Инструменты рисования. Кнопки взаимоисключающие: включённый
+        # инструмент один, иначе клик по холсту непонятно что делает.
+        self.tool_btns = {}
+        for name, txt, tip in (
+                ("line", "Линия (L)",
+                 "Зажмите ЛКМ и протяните. Линии выделяются, таскаются, "
+                 "копируются Ctrl+C / Ctrl+V, удаляются Del."),
+                ("rect", "Прямоугольник",
+                 "Рамка станет четырьмя обычными линиями — каждую можно "
+                 "двигать и править отдельно."),
+                ("circle", "Окружность",
+                 "От центра к краю: радиус округляется к шагу сетки."),
+                ("arc", "Дуга",
+                 "От центра к краю. Углы правятся числом справа — "
+                 "по умолчанию верхняя половина."),
+                ("poly", "Ломаная",
+                 "Клики по вершинам, двойной клик или Enter — закончить. "
+                 "Кнопка «Заливка» замыкает её в полигон.")):
+            b = QPushButton(txt)
+            b.setCheckable(True)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, k=name: self._tool(k))
+            self.tool_btns[name] = b
+            bar.addWidget(b)
+        self.btn_line = self.tool_btns["line"]
+        self.btn_rect = self.tool_btns["rect"]
         for txt, fn in (
                 ("Разложить слева", lambda: self.canvas.spread("L", self.sp_pitch.value())),
                 ("Разложить справа", lambda: self.canvas.spread("R", self.sp_pitch.value())),
@@ -923,6 +1606,75 @@ class SymbolEditor(QDialog):
         bar2.addWidget(self.btn_explode)
         bar2.addStretch(1)
 
+        # Третий ряд -- работа с выделенным: выравнивание, распределение,
+        # заливка, поворот, углы дуги. Всё это одинаково относится и к
+        # выводам, и к линиям, и к фигурам.
+        bar3 = QHBoxLayout()
+        bar3.addWidget(QLabel("выровнять:"))
+        for txt, how, tip in (("◧", "left", "по левому краю"),
+                              ("◨", "right", "по правому краю"),
+                              ("⌶", "cx", "по вертикальной оси"),
+                              ("⎺", "top", "по верхнему краю"),
+                              ("⎽", "bottom", "по нижнему краю"),
+                              ("⌷", "cy", "по горизонтальной оси")):
+            b = QPushButton(txt)
+            b.setFixedWidth(30)
+            b.setToolTip(f"Выровнять выделенное {tip}")
+            b.clicked.connect(lambda _=False, h=how: self._align(h))
+            bar3.addWidget(b)
+        bar3.addSpacing(10)
+        bar3.addWidget(QLabel("разложить поровну:"))
+        for txt, ax in (("по X", "x"), ("по Y", "y")):
+            b = QPushButton(txt)
+            b.setToolTip("Равные промежутки между выделенными объектами "
+                         "(от трёх штук)")
+            b.clicked.connect(lambda _=False, a=ax: self._distribute(a))
+            bar3.addWidget(b)
+        bar3.addSpacing(10)
+        b_fill = QPushButton("Заливка")
+        b_fill.setToolTip("Залить выделенные фигуры; ломаная при этом "
+                          "замыкается в полигон")
+        b_fill.clicked.connect(lambda: self.canvas.toggle_fill())
+        bar3.addWidget(b_fill)
+        b_rot = QPushButton("Повернуть 90°")
+        b_rot.setToolTip("Повернуть выделенные линии и фигуры вокруг "
+                         "центра выделения")
+        b_rot.clicked.connect(lambda: self.canvas.rotate_selection(90.0))
+        bar3.addWidget(b_rot)
+        b_style = QPushButton("Стиль по образцу")
+        b_style.setToolTip("Толщина и цвет первого выделенного объекта — "
+                           "всем остальным выделенным")
+        b_style.clicked.connect(self._copy_style)
+        bar3.addWidget(b_style)
+        bar3.addSpacing(10)
+        bar3.addWidget(QLabel("дуга, °:"))
+        self.sp_a1 = QSpinBox()
+        self.sp_a1.setRange(-360, 360)
+        self.sp_a1.setValue(0)
+        self.sp_a2 = QSpinBox()
+        self.sp_a2.setRange(-360, 720)
+        self.sp_a2.setValue(180)
+        for w_ in (self.sp_a1, self.sp_a2):
+            w_.setFixedWidth(70)
+            w_.setToolTip("Углы дуги против часовой стрелки: 0° — вправо, "
+                          "90° — вверх")
+        b_arc = QPushButton("Задать")
+        b_arc.clicked.connect(self._apply_arc)
+        bar3.addWidget(self.sp_a1)
+        bar3.addWidget(self.sp_a2)
+        bar3.addWidget(b_arc)
+        bar3.addSpacing(10)
+        self.cb_snap = QCheckBox("привязка к концам")
+        self.cb_snap.setChecked(True)
+        self.cb_snap.setToolTip(
+            "Новая точка прилипает к концу линии, вершине фигуры или "
+            "выводу рядом — иначе стык на глаз не поймать, а щель в "
+            "пару милов в Altium видно.")
+        self.cb_snap.toggled.connect(
+            lambda v: setattr(self.canvas, "snap_ends", bool(v)))
+        bar3.addWidget(self.cb_snap)
+        bar3.addStretch(1)
+
         self.btn_reset = QPushButton("Вернуть автоматическую раскладку")
         self.btn_reset.setToolTip(
             "Символ снова будет собираться автоматом по ГОСТ, "
@@ -974,8 +1726,16 @@ class SymbolEditor(QDialog):
         lay = QVBoxLayout(self)
         lay.addLayout(bar)
         lay.addLayout(bar2)
+        lay.addLayout(bar3)
         lay.addWidget(split, 1)
         lay.addLayout(row)
+        # Три ряда кнопок и дерево секций дают минимум шире монитора --
+        # снимаем его и открываемся по рабочей области того же экрана,
+        # а не «как получится».
+        from .widgets import allow_narrow, fit_to_screen
+        allow_narrow(self, extra=(self.canvas,))
+        self.canvas.setMinimumSize(320, 240)
+        fit_to_screen(self, 1180, 780)
         self._fill_tree()
 
     def _fill_tree(self):
@@ -1134,23 +1894,47 @@ class SymbolEditor(QDialog):
             f"Графика разобрана на {n} линий — теперь их можно двигать, "
             f"менять толщину и цвет.")
 
-    def _rect_mode(self):
-        self.canvas.rect_mode = self.btn_rect.isChecked()
-        if self.canvas.rect_mode:
-            self.btn_line.setChecked(False)
-            self.canvas.line_mode = False
-        self.canvas._line_start = None
+    def _tool(self, name: str):
+        """Включить инструмент рисования, остальные кнопки отжать."""
+        self.canvas.set_tool(name)
+        self._sync_tools(self.canvas.tool)
         self.canvas.setFocus()
-        self.canvas.update()
+
+    def _sync_tools(self, active: str):
+        for k, b in self.tool_btns.items():
+            b.setChecked(k == active)
+
+    def _align(self, how: str):
+        n = self.canvas.align(how)
+        if not n:
+            self._say("Выделите хотя бы два объекта — выводы, линии "
+                      "или фигуры")
+
+    def _distribute(self, axis: str):
+        n = self.canvas.distribute(axis)
+        if not n:
+            self._say("Разложить с равными промежутками можно от трёх "
+                      "объектов")
+
+    def _copy_style(self):
+        n = self.canvas.copy_style()
+        self._say(f"Стиль применён к {n} объектам" if n else
+                  "Выделите сначала образец, потом (с Ctrl) остальные")
+
+    def _apply_arc(self):
+        n = self.canvas.set_arc_angles(self.sp_a1.value(), self.sp_a2.value())
+        if not n:
+            self._say("Выделите дугу — углы задаются ей")
+
+    def _say(self, text: str):
+        """Короткая подсказка в заголовке окна редактора."""
+        self.setWindowTitle(f"{self._title} — {text}" if text else self._title)
+
+    def _rect_mode(self):
+        self._tool("rect")
 
     def _line_mode(self):
-        self.canvas.line_mode = self.btn_line.isChecked()
-        if self.canvas.line_mode:
-            self.btn_rect.setChecked(False)
-            self.canvas.rect_mode = False
-        self.canvas._line_start = None
-        self.canvas.setFocus()
-        self.canvas.update()
+        self._tool("line")
 
     def _reset(self):
         self._do_reset = True

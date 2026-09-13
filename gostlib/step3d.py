@@ -29,7 +29,14 @@ _POINT_RE = re.compile(
     re.I)
 _VERTEX_RE = re.compile(
     rb"VERTEX_POINT\s*\(\s*'[^']*'\s*,\s*#\s*(\d+)", re.I)
-_NUM_RE = re.compile(rb"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+# ВНИМАНИЕ к форме числа. STEP из OpenCASCADE (а значит и почти все
+# модели KiCad StepUp) пишет мантиссу с точкой на конце: `2.E-002`.
+# Прежнее выражение `\d*\.?\d+` требовало цифру ПОСЛЕ точки, поэтому от
+# `2.E-002` откусывало «2» и порядок терялся: 0,02 мм превращались в 2 мм.
+# У QFN-20 от этого высота корпуса выходила 2 мм вместо 0,78 -- модель в
+# просмотре была втрое выше настоящей, и на столько же ошибались габариты
+# и посадка тела на плату.
+_NUM_RE = re.compile(rb"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?")
 # Рёбра: EDGE_CURVE ссылается на два VERTEX_POINT. По ним рисуется каркас --
 # он куда понятнее облака точек и сразу показывает форму корпуса.
 _EDGE_RE = re.compile(
@@ -136,6 +143,41 @@ class Model:
         out.append(f"Вершин: {self.total}"
                    + (" (для превью взята часть)" if self.truncated else ""))
         return out
+
+
+def z_range(path: str) -> Optional[Tuple[float, float]]:
+    """
+    Нижняя и верхняя точка модели по Z, быстро и без полного разбора.
+
+    Нужно для посадки тела на плату. Altium считает Z = 0 плоскостью
+    платы, а модели из EasyEDA приходят с началом координат где придётся:
+    у FBGA-96 геометрия шла от -0.37 до +0.73 мм, то есть шарики уходили
+    ВНУТРЬ платы на треть миллиметра. Смещение кладётся в standoff, сам
+    файл модели не трогаем -- он может быть чужой.
+
+    Считаем только по вершинам реальной геометрии (VERTEX_POINT): начала
+    вспомогательных систем координат лежат в тех же CARTESIAN_POINT и
+    габарит бы завысили.
+    """
+    try:
+        raw = open(path, "rb").read()
+    except OSError:
+        return None
+    pts: Dict[int, float] = {}
+    for m in _POINT_RE.finditer(raw):
+        nums = _NUM_RE.findall(m.group(2))
+        if len(nums) >= 3:
+            try:
+                pts[int(m.group(1))] = float(nums[2])
+            except ValueError:
+                continue
+    used = [pts[int(m.group(1))] for m in _VERTEX_RE.finditer(raw)
+            if int(m.group(1)) in pts]
+    if not used:
+        used = list(pts.values())
+    if not used:
+        return None
+    return (min(used), max(used))
 
 
 def parse(path: str, max_points: int = MAX_POINTS) -> Model:

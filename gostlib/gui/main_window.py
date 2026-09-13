@@ -17,13 +17,15 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
                                QSplitter, QStatusBar, QTabWidget, QTableView,
                                QTableWidget, QTableWidgetItem, QToolBar,
                                QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                               QWidget, QCheckBox, QSpinBox)
+                               QWidget, QCheckBox, QSpinBox,
+                               QSizePolicy)
 
 from .. import classify, config
 from ..ir import ETYPES, Component
 from ..render import svg
 from ..service import Service
 from .dialogs import KicadDialog, LcscDialog, SettingsDialog
+from .symedit import PinPlanDialog
 from .view3d import Model3DPane
 from .widgets import PreviewPane
 
@@ -173,30 +175,38 @@ class ModelWorker(QThread):
         self.stale = False
 
     def run(self):
-        from .. import step3d
+        from .. import mesh3d
         extra: List[str] = []
         model = mesh = None
+        # Сначала пробуем нормальную поверхность. Для моделей EasyEDA рядом
+        # со STEP лежит исходный OBJ: он читается примерно за секунду, тогда
+        # как повторный разбор фасетного STEP может занимать минуты.
         try:
-            model = step3d.parse(self.path)
-            extra += model.lines() + step3d.compare_with_footprint(model,
-                                                                   self.fp)
+            mesh = mesh3d.load(self.path,
+                               os.path.join(self.models_dir, "_mesh_cache"))
+            if mesh.ok:
+                extra += mesh3d.describe(mesh)
+                extra += mesh3d.compare_with_footprint(mesh, self.fp)
+                b = mesh.bbox()
+                if b:
+                    extra.append(f"Точная высота модели: "
+                                 f"{b[5] - b[2]:.2f} мм")
         except Exception as e:
-            extra.append(f"3D-модель: не разобралась ({e})")
-        if not self.stale and model is not None and getattr(model, "ok", False):
+            mesh = None
+            extra.append(f"3D-поверхность не построилась: {e}")
+        if mesh is not None and mesh.error:
+            extra.append(mesh.error)
+
+        # Старый STEP-парсер оставляем запасным путём для установок без
+        # trimesh/cascadio и для необычных файлов, которые они не приняли.
+        if not self.stale and not (mesh is not None and mesh.ok):
             try:
-                from .. import mesh3d
-                mesh = mesh3d.load(self.path,
-                                   os.path.join(self.models_dir, "_mesh_cache"))
-                if mesh.ok:
-                    extra += mesh3d.describe(mesh)
-                    b = mesh.bbox()
-                    if b:
-                        extra.append(f"Точная высота по сетке: "
-                                     f"{b[5] - b[2]:.2f} мм")
-                elif mesh.error:
-                    extra.append(mesh.error)
+                from .. import step3d
+                model = step3d.parse(self.path)
+                extra += model.lines() + step3d.compare_with_footprint(
+                    model, self.fp)
             except Exception as e:
-                extra.append(f"Точная сетка не построилась: {e}")
+                extra.append(f"3D-модель: не разобралась ({e})")
         self.done.emit(self.token, model, mesh, extra)
 
 
@@ -242,7 +252,12 @@ class BuildDialog(QDialog):
         self.state = QLabel("")
         self.state.setWordWrap(True)
         f = self.state.font()
-        f.setPointSize(f.pointSize() + 1)
+        # У шрифта, заданного в пикселях, pointSize() возвращает -1, и
+        # прибавка к нему даёт 0 -- Qt ругается «Point size <= 0».
+        if f.pointSize() > 0:
+            f.setPointSize(f.pointSize() + 1)
+        elif f.pixelSize() > 0:
+            f.setPixelSize(f.pixelSize() + 2)
         self.state.setFont(f)
 
         self.body = QPlainTextEdit()
@@ -257,6 +272,16 @@ class BuildDialog(QDialog):
             f"Схемная: {res.get('schlib', '')}",
             f"Посадки: {res.get('pcblib', '')}",
         ]
+        # Крупная 3D-модель -- главная причина, по которой сборка идёт
+        # минутами: Altium разбирает фасетный STEP дольше, чем создаёт
+        # сотни площадок. Предупреждаем ДО запуска, а не после.
+        if res.get("heavy3d"):
+            info += ["", "Крупные 3D-модели — сборка будет долгой:"]
+            for item in res["heavy3d"].split(";")[:5]:
+                nm, _, mb = item.rpartition(":")
+                info.append(f"  {nm}: {mb} МБ")
+            info.append("  «Запасные пути → Пережать 3D-модели» ускорит "
+                        "сборку в разы")
         if res.get("problems"):
             info += ["", "Замечания по заданию:"] + [
                 "  " + x for x in res["problems"].splitlines()[:15]]
@@ -347,9 +372,12 @@ class MainWindow(QMainWindow):
         self.current: Optional[Component] = None
         self._worker: Optional[ImportWorker] = None
         self._model_loader: Optional[ModelWorker] = None
+        self._model_loaders = set()  # держим старые QThread до finished
+        self._queued_model = None    # нативный 3D-бэкенд запускаем по одному
         self._model_token = 0
         self._model_lines: List[str] = []
         self._model_fp = None
+        self._pending_model = None
         # параметры, вынесенные в таблицу отдельными колонками
         self.extra_cols: List[str] = list(getattr(self.cfg, "table_params", []))
 
@@ -359,8 +387,17 @@ class MainWindow(QMainWindow):
         from .. import __version__ as _ver
         self.setWindowTitle(
             f"GostLib {_ver} — библиотека компонентов для Altium (ЕСКД)")
-        self.resize(1500, 900)
+        # Не открываться шире монитора: на 1920 окно 1500x900 влезает, но
+        # если человек унесёт настройки на ноутбук с 1366, Qt начнёт
+        # обрезать геометрию сам и ругаться в консоль.
+        try:
+            from PySide6.QtGui import QGuiApplication
+            av = QGuiApplication.primaryScreen().availableGeometry()
+            self.resize(min(1500, av.width() - 40), min(900, av.height() - 60))
+        except Exception:
+            self.resize(1500, 900)
         self._build_ui()
+        self._allow_narrow_window()
         self.refresh_projects()
         self.refresh_proj_tree()
         self.refresh_types()
@@ -471,6 +508,30 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.cb_imp_proj)
         tb.addSeparator()
 
+        # Общая библиотека на отдел живёт не в SQLite, а в текстовой папке,
+        # которую ведут в git. Кнопки собраны в одно меню: это не то, чем
+        # пользуются каждую минуту.
+        git_btn = QPushButton("Репозиторий ▾")
+        git_btn.setToolTip(
+            "Текстовая копия библиотеки для git: её можно коммитить, "
+            "смотреть в pull request и синхронизировать между машинами")
+        self.git_menu = QMenu(self)
+        self.git_menu.addAction("Выложить библиотеку в папку",
+                                self.do_git_export)
+        self.git_menu.addAction("Что изменилось", self.do_git_status)
+        self.git_menu.addAction("Забрать новое из папки",
+                                lambda: self.do_git_import(False))
+        self.git_menu.addAction("Взять версию из репозитория (перезаписать)",
+                                lambda: self.do_git_import(True))
+        self.git_menu.addSeparator()
+        self.git_menu.addAction("Синхронизировать", self.do_git_sync)
+        self.git_menu.addSeparator()
+        self.git_menu.addAction("Открыть папку",
+                                lambda: self._open(self.svc.git_root()))
+        git_btn.setMenu(self.git_menu)
+        tb.addWidget(git_btn)
+        tb.addSeparator()
+
         view_btn = QPushButton("Вид ▾")
         self.view_menu = QMenu(self)
         self.act_panel = self.view_menu.addAction("Панель просмотра")
@@ -545,6 +606,9 @@ class MainWindow(QMainWindow):
         altm.addSeparator()
         altm.addAction("Доставить пакеты для просмотра 3D телом",
                        self.do_setup3d)
+        altm.addAction("Пережать 3D-модели (ускорить сборку)…",
+                       self.do_shrink_models)
+        altm.addAction("Посадить 3D-модели на плату…", self.do_reseat_models)
         alt.setMenu(altm)
         tb.addWidget(alt)
         tb.addSeparator()
@@ -604,6 +668,9 @@ class MainWindow(QMainWindow):
             lb = QLabel(txt)
             lb.setToolTip(tip)
             lb.setWordWrap(True)
+            # перенос по словам сам по себе минимальную ширину не снимает
+            lb.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lb.setMinimumWidth(60)
             sv.addWidget(lb)
             self.step_labels.append(lb)
 
@@ -707,6 +774,7 @@ class MainWindow(QMainWindow):
         self.fp_pick.currentIndexChanged.connect(self._show_footprint)
         self.model_view = Model3DPane()
         self.model_view.transform_changed.connect(self._model_moved)
+        self.model_view.color_changed.connect(self._model_color_changed)
         self.fp_info = QPlainTextEdit()
         self.fp_info.setReadOnly(True)
         self.fp_info.setMaximumHeight(210)
@@ -715,6 +783,12 @@ class MainWindow(QMainWindow):
         b3d = QPushButton("Подгрузить / заменить 3D…")
         b3d.setToolTip("STEP кладётся как есть; OBJ/STL конвертируются в STEP")
         b3d.clicked.connect(self.do_set_model)
+        self.b3d_preview = QPushButton("Показать тяжёлую 3D")
+        self.b3d_preview.setToolTip(
+            "Разобрать большую STEP-модель вручную. Во время разбора "
+            "интерфейс может работать медленнее.")
+        self.b3d_preview.clicked.connect(self._load_pending_model)
+        self.b3d_preview.setEnabled(False)
         b3dx = QPushButton("Убрать 3D")
         b3dx.clicked.connect(self.do_clear_model)
         bmod = QPushButton("Папка моделей")
@@ -734,11 +808,30 @@ class MainWindow(QMainWindow):
         bt = QPushButton("Угол в ленте")
         bt.clicked.connect(self.do_set_tape)
 
+        # Дозагрузка посадки. Часто в источнике приезжает только символ
+        # (и иногда 3D), а посадки нет или подобралась не та. Раньше
+        # лечилось повторным импортом -- с потерей всей ручной работы
+        # над УГО; теперь посадка добирается отдельно.
+        b_addfp = QPushButton("Дозагрузить посадку…")
+        b_addfp.setToolTip(
+            "Взять посадочное место из KiCad и добавить его этому "
+            "компоненту.\nСимвол, раскладка выводов и параметры остаются "
+            "как есть.")
+        b_addfp.clicked.connect(lambda: self.do_attach_footprint(False))
+        b_repfp = QPushButton("Заменить посадку…")
+        b_repfp.setToolTip(
+            "То же самое, но вместо текущей посадки.\nЗазоры, паста, "
+            "высота и 3D-модель переносятся на новую.")
+        b_repfp.clicked.connect(lambda: self.do_attach_footprint(True))
+
         fprow1 = QHBoxLayout()
         fprow1.addWidget(QLabel("Посадка:"))
         fprow1.addWidget(self.fp_pick, 1)
+        fprow1.addWidget(b_addfp)
+        fprow1.addWidget(b_repfp)
         fprow2 = QHBoxLayout()
         fprow2.addWidget(b3d)
+        fprow2.addWidget(self.b3d_preview)
         fprow2.addWidget(b3dx)
         fprow2.addWidget(bmod)
         fprow2.addStretch(1)
@@ -747,6 +840,76 @@ class MainWindow(QMainWindow):
         fprow2.addWidget(bh)
         fprow2.addWidget(self.tape_edit)
         fprow2.addWidget(bt)
+
+        # Зазоры маски и пасты -- свойство ЭТОЙ посадки, а не библиотеки:
+        # у BGA один зазор, у QFN с тепловым пятном другой. Пусто —
+        # не задавать, Altium возьмёт правило проекта.
+        fprow3 = QHBoxLayout()
+        self.mask_edit = QLineEdit()
+        self.mask_edit.setPlaceholderText("правило проекта")
+        self.mask_edit.setFixedWidth(120)
+        self.mask_edit.setToolTip(
+            "Зазор паяльной маски на сторону, мм, для всех площадок этой "
+            "посадки.\n"
+            "Пусто — не задавать: Altium применит правило проекта.\n\n"
+            "Задаётся через кеш площадки — тот же путь, что у Altium в "
+            "свойствах Solder/Paste. В свойствах площадки после сборки "
+            "будет «Manual» вместо «Rule Expansion».")
+        self.paste_edit = QLineEdit()
+        self.paste_edit.setPlaceholderText("правило проекта")
+        self.paste_edit.setFixedWidth(120)
+        self.paste_edit.setToolTip(
+            "Зазор трафарета пасты на сторону, мм. Обычно отрицательный: "
+            "окно меньше площадки.\n"
+            "Пусто — правило проекта.")
+        b_exp = QPushButton("Применить зазоры")
+        b_exp.clicked.connect(self.do_set_expansion)
+        # Паста -- свойство компонента целиком: трафарет режут на деталь,
+        # а не на отдельную посадку. Разъём под запрессовку, тестовый
+        # пятак, экран под ручную пайку -- пасты быть не должно вовсе.
+        self.cb_paste = QCheckBox("наносить пасту")
+        self.cb_paste.setChecked(True)
+        self.cb_paste.setToolTip(
+            "Снимите — и в трафарете не будет окон под этот компонент.\n"
+            "В Altium это видно как большой отрицательный «Manual "
+            "Expansion»\nу площадок: отдельного флага в скриптовом API нет, "
+            "а такой\nзазор закрывает окно наверняка.")
+        self.cb_paste.toggled.connect(self.do_toggle_paste)
+        fprow3.addWidget(QLabel("Зазор маски, мм:"))
+        fprow3.addWidget(self.mask_edit)
+        fprow3.addWidget(QLabel("пасты, мм:"))
+        fprow3.addWidget(self.paste_edit)
+        fprow3.addWidget(b_exp)
+        fprow3.addWidget(self.cb_paste)
+        fprow3.addStretch(1)
+
+        # Сетка окон пасты у крупных площадок. Сплошное окно на тепловом
+        # пятаке QFN -- классическая причина всплывшей детали и коротышей
+        # на соседних выводах; в производстве такое окно всегда разбивают.
+        fprow4 = QHBoxLayout()
+        self.paste_grid = QComboBox()
+        self.paste_grid.addItem("сплошное окно", 0)
+        for n in (2, 3, 4, 5):
+            self.paste_grid.addItem(f"{n}×{n}", n)
+        self.paste_grid.setToolTip(
+            "Окно пасты у крупных площадок — сеткой квадратиков вместо\n"
+            "сплошного. Мелких площадок не касается.")
+        self.paste_over = QLineEdit("1")
+        self.paste_over.setFixedWidth(60)
+        self.paste_over.setToolTip("Сетка ставится площадкам крупнее этого, мм")
+        self.paste_fill = QLineEdit("60")
+        self.paste_fill.setFixedWidth(60)
+        self.paste_fill.setToolTip("Сколько процентов площадки накрыть пастой")
+        b_grid = QPushButton("Применить сетку")
+        b_grid.clicked.connect(self.do_set_paste_grid)
+        fprow4.addWidget(QLabel("Окно пасты:"))
+        fprow4.addWidget(self.paste_grid)
+        fprow4.addWidget(QLabel("у площадок от, мм:"))
+        fprow4.addWidget(self.paste_over)
+        fprow4.addWidget(QLabel("покрытие, %:"))
+        fprow4.addWidget(self.paste_fill)
+        fprow4.addWidget(b_grid)
+        fprow4.addStretch(1)
 
         views = QSplitter(Qt.Horizontal)
         views.addWidget(self.fp_view)
@@ -761,14 +924,26 @@ class MainWindow(QMainWindow):
         fpv.addWidget(views, 1)
         fpv.addWidget(self.fp_info)
         fpv.addLayout(fprow2)
+        fpv.addLayout(fprow3)
+        fpv.addLayout(fprow4)
 
-        self.params = QTableWidget(0, 3)
-        self.params.setHorizontalHeaderLabels(["Параметр", "Значение", "Ед."])
+        self.params = QTableWidget(0, 5)
+        self.params.setHorizontalHeaderLabels(
+            ["Параметр", "Значение", "Ед.", "Тип", "На схеме"])
         self.params.horizontalHeader().setStretchLastSection(False)
         self.params.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.params.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         pbtn = QPushButton("Сохранить параметры и пересобрать символ")
         pbtn.clicked.connect(self.save_params)
+        # Свои параметры: у каждого компонента бывает что-то своё --
+        # «ТокНагрузки», «ДатаЗакупки», ссылка на карточку у поставщика.
+        b_padd = QPushButton("+ Свой параметр")
+        b_padd.setToolTip("Добавить параметр с собственным именем, "
+                          "единицей и типом")
+        b_padd.clicked.connect(self.do_add_param)
+        b_pdel = QPushButton("− Удалить строку")
+        b_pdel.setToolTip("Убрать выделенный параметр")
+        b_pdel.clicked.connect(self.do_del_param)
         self.type_box = QComboBox()
         for code, ru, pref in classify.CTYPES:
             self.type_box.addItem(f"{ru}  ({pref})", code)
@@ -789,11 +964,16 @@ class MainWindow(QMainWindow):
         pv.setContentsMargins(4, 4, 4, 4)
         pv.addLayout(prow)
         pv.addWidget(self.params, 1)
-        pv.addWidget(pbtn)
+        prow2 = QHBoxLayout()
+        prow2.addWidget(b_padd)
+        prow2.addWidget(b_pdel)
+        prow2.addStretch(1)
+        prow2.addWidget(pbtn)
+        pv.addLayout(prow2)
 
-        self.pins = QTableWidget(0, 5)
+        self.pins = QTableWidget(0, 6)
         self.pins.setHorizontalHeaderLabels(
-            ["Контакт", "Имя", "Тип", "Сторона", "Группа"])
+            ["Контакт", "Имя", "Тип", "Секция", "Сторона", "Группа"])
         self.pins.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         # Строки таскаются мышью: у разъёмов порядок выводов на схеме не
         # совпадает ни с номерами, ни с именами, и задать его можно только
@@ -818,6 +998,17 @@ class MainWindow(QMainWindow):
         pinsort = QPushButton("По номерам")
         pinsort.setToolTip("Вернуть порядок по номерам контактов")
         pinsort.clicked.connect(self._sort_pin_rows)
+        pinai = QPushButton("ИИ-раскладка…")
+        pinai.setToolTip(
+            "Скопировать все выводы в текст для ИИ и принять готовую "
+            "раскладку обратно")
+        pinai.clicked.connect(self.ai_pin_plan)
+        pintidy = QPushButton("Привести в порядок")
+        pintidy.setToolTip(
+            "Разнести питание и землю по своим секциям, выровнять стороны\n"
+            "и разбить слишком длинные столбики. Работает и без ИИ — по\n"
+            "именам выводов.")
+        pintidy.clicked.connect(self.tidy_pins)
         pinbtn = QPushButton("Применить раскладку выводов")
         pinbtn.clicked.connect(self.save_pins)
         pinreset = QPushButton("Сбросить на автоматическую")
@@ -826,6 +1017,8 @@ class MainWindow(QMainWindow):
         hb.addWidget(pinup)
         hb.addWidget(pindn)
         hb.addWidget(pinsort)
+        hb.addWidget(pinai)
+        hb.addWidget(pintidy)
         hb.addWidget(pinbtn, 1)
         hb.addWidget(pinreset)
         pinw = QWidget()
@@ -862,6 +1055,14 @@ class MainWindow(QMainWindow):
         self.cb_nums.clicked.connect(self._toggle_comp_numbers)
         symrow.addWidget(self.cb_nums)
 
+        self.cb_compact = QCheckBox("компактно по сетке")
+        self.cb_compact.setToolTip(
+            "Подогнать автоматическое УГО под ширину текста в Altium и "
+            "сделать одинаковые боковые поля минимально необходимой "
+            "ширины. Настройка только этого компонента.")
+        self.cb_compact.clicked.connect(self._toggle_compact)
+        symrow.addWidget(self.cb_compact)
+
         symrow.addWidget(QLabel("масштаб УГО:"))
         self.sp_scale = QSpinBox()
         self.sp_scale.setRange(20, 300)
@@ -890,21 +1091,29 @@ class MainWindow(QMainWindow):
         self.b_own_reset.clicked.connect(self._reset_comp_style)
         symrow.addWidget(self.b_own_reset)
 
-        # Секция для превью. У многосекционного символа показывать всё
-        # разом бессмысленно: в Altium секции лежат на разных листах, а
-        # вместе выглядят кучей наложенных корпусов.
-        symrow.addSpacing(12)
-        self.lb_prev_part = QLabel("секция:")
+        # Секция для превью. Держим переключатель ОТДЕЛЬНОЙ строкой: после
+        # добавления личных настроек первая строка стала шире панели и этот
+        # комбобокс фактически уезжал за правый край. Из-за этого секции
+        # можно было посмотреть только через «Редактировать УГО».
+        self.prev_part_bar = QWidget()
+        partrow = QHBoxLayout(self.prev_part_bar)
+        partrow.setContentsMargins(0, 0, 0, 0)
+        partrow.setSpacing(6)
+        self.lb_prev_part = QLabel("Просмотр части УГО:")
         self.cb_prev_part = QComboBox()
-        self.cb_prev_part.setToolTip("Какую секцию символа показывать")
+        self.cb_prev_part.setMinimumWidth(130)
+        self.cb_prev_part.setToolTip(
+            "Какую секцию показывать в обычном превью — открывать "
+            "редактор УГО не требуется")
         self.cb_prev_part.currentIndexChanged.connect(self._redraw_symbol)
-        symrow.addWidget(self.lb_prev_part)
-        symrow.addWidget(self.cb_prev_part)
-        self.lb_prev_part.hide()
-        self.cb_prev_part.hide()
+        partrow.addWidget(self.lb_prev_part)
+        partrow.addWidget(self.cb_prev_part)
+        partrow.addStretch(1)
+        self.prev_part_bar.hide()
 
         symrow.addStretch(1)
         symv.addLayout(symrow)
+        symv.addWidget(self.prev_part_bar)
         symv.addWidget(self.sym_view, 1)
 
         # Правила группировки выводов. Живут рядом с параметрами: это
@@ -958,6 +1167,13 @@ class MainWindow(QMainWindow):
         # проект.
         self.lbl_target = QLabel("")
         self.lbl_target.setStyleSheet("color:#8aa;")
+        # В подписи полный путь к библиотеке, и она тянула минимальную
+        # ширину окна до 1970 px -- на мониторе 1920 окно переставало
+        # помещаться, Qt ругался и обрезал геометрию. Пусть надпись
+        # сжимается: полный путь всё равно есть в подсказке.
+        self.lbl_target.setSizePolicy(QSizePolicy.Ignored,
+                                      QSizePolicy.Preferred)
+        self.lbl_target.setMinimumWidth(80)
         self.statusBar().addPermanentWidget(self.lbl_target)
 
     # ------------------------------------------------------------ данные ----
@@ -1144,6 +1360,48 @@ class MainWindow(QMainWindow):
         self._fill_own_style(c)
         self._fill_rules(c)
 
+    def _allow_narrow_window(self):
+        """
+        Дать окну сжиматься до нормального монитора.
+
+        Суммарная минимальная ширина панелей доходила до 1970 px: на
+        мониторе 1920 окно уже не помещалось, Qt писал «Unable to set
+        geometry» и обрезал его сам. Минимум окна складывается из
+        минимумов вложенных раскладок, поэтому снимаем это ограничение у
+        крупных панелей -- пусть содержимое ужимается, а не диктует
+        размер окна.
+        """
+        from PySide6.QtWidgets import QLayout, QSplitter, QTabWidget
+
+        def relax(w, mw=140, mh=100):
+            """
+            Разрешить панели быть узкой.
+
+            Ключ тут -- политика Ignored: при ней Qt перестаёт считать
+            минимумом подсказку раскладки и берёт явно заданный минимум.
+            Одного setMinimumWidth мало -- подсказка всё равно побеждает.
+            """
+            if w is None:
+                return
+            lay = w.layout() if hasattr(w, "layout") else None
+            if lay is not None:
+                lay.setSizeConstraint(QLayout.SetNoConstraint)
+            w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+            w.setMinimumSize(mw, mh)
+
+        for tw in self.findChildren(QTabWidget):
+            for i in range(tw.count()):
+                relax(tw.widget(i))
+            relax(tw, 200, 120)
+        for sp in self.findChildren(QSplitter):
+            sp.setChildrenCollapsible(True)
+            for i in range(sp.count()):
+                relax(sp.widget(i))
+            relax(sp, 160, 100)
+        for name in ("fp_view", "model_view", "sym_view"):
+            relax(getattr(self, name, None), 160, 120)
+        relax(self.centralWidget(), 320, 200)
+
     def _fill_prev_parts(self, c: Component):
         """Список секций над превью. У односекционного символа он скрыт."""
         sym = c.symbol
@@ -1157,8 +1415,7 @@ class MainWindow(QMainWindow):
         self.cb_prev_part.setCurrentIndex(0)
         self.cb_prev_part.blockSignals(False)
         show = n > 1
-        self.lb_prev_part.setVisible(show)
-        self.cb_prev_part.setVisible(show)
+        self.prev_part_bar.setVisible(show)
 
     def _redraw_symbol(self):
         c = self.current
@@ -1181,13 +1438,15 @@ class MainWindow(QMainWindow):
         """Показать личные настройки компонента, не трогая общие."""
         st = self.svc.style()
         over = getattr(c, "style_over", None) or {}
-        for w in (self.cb_nums, self.sp_scale):
+        for w in (self.cb_nums, self.cb_compact, self.sp_scale):
             w.blockSignals(True)
         self.cb_nums.setChecked(bool(over.get("show_pin_numbers",
                                               st.show_pin_numbers)))
         self.sp_scale.setValue(int(round(float(
             over.get("passive_scale", st.passive_scale)) * 100)))
-        for w in (self.cb_nums, self.sp_scale):
+        self.cb_compact.setChecked(bool(over.get("compact_symbols",
+                                                 st.compact_symbols)))
+        for w in (self.cb_nums, self.cb_compact, self.sp_scale):
             w.blockSignals(False)
         self.b_own_reset.setEnabled(bool(over))
         src = getattr(c, "symbol_source", "gost")
@@ -1199,6 +1458,7 @@ class MainWindow(QMainWindow):
         # масштаб есть смысл крутить только у двухвыводной графики
         shape = classify.SYMBOL_SHAPE.get(c.ctype, "box")
         self.sp_scale.setEnabled(shape not in ("box", "connector"))
+        self.cb_compact.setEnabled(shape == "box")
 
     def _set_own(self, **kw):
         c = self.current
@@ -1330,6 +1590,92 @@ class MainWindow(QMainWindow):
                 self.refresh_table()))
         m.exec(self.proj_tree.viewport().mapToGlobal(pos))
 
+    def do_shrink_models(self):
+        """
+        Пережать крупные 3D-модели под текущую «подробность 3D».
+
+        Именно они делают сборку многоминутной: разбор фасетного STEP --
+        самая дорогая операция в Altium. Замер на живом проекте: посадка с
+        моделью на 23 МБ строилась 337 секунд, соседняя посадка из 355
+        площадок -- 8,5 секунды.
+        """
+        heavy = self.svc.heavy_models()
+        budget = int(getattr(self.cfg, "model_faces", 6000))
+        if not heavy:
+            QMessageBox.information(
+                self, "GostLib",
+                "Крупных 3D-моделей нет — сборку они не тормозят.")
+            return
+        lines = [f"Крупных моделей: {len(heavy)}", ""]
+        for n, size in heavy[:10]:
+            lines.append(f"  {n} — {_mb(size)}")
+        if len(heavy) > 10:
+            lines.append(f"  … и ещё {len(heavy) - 10}")
+        lines += ["",
+                  f"Пережать под текущую подробность ({budget} треугольников)?",
+                  "Исходные .obj останутся на месте, так что операция "
+                  "обратима: поднимете подробность — пережмёте заново.",
+                  "Модели без исходного .obj рядом пропускаются."]
+        if QMessageBox.question(self, "Пережать 3D-модели",
+                                "\n".join(lines)) != QMessageBox.Yes:
+            return
+        self.setEnabled(False)
+        try:
+            res = self.svc.shrink_models(budget=budget)
+        except Exception as e:
+            self.setEnabled(True)
+            QMessageBox.warning(self, "GostLib", f"Не вышло: {e}")
+            return
+        self.setEnabled(True)
+        done, skip = res["done"], res["skipped"]
+        msg = [f"Пережато моделей: {len(done)}"]
+        if done:
+            msg.append(f"Было {_mb(res['before'])}, стало {_mb(res['after'])}")
+            msg.append("")
+            msg.append("Пересоберите библиотеку — сборка должна заметно "
+                       "ускориться.")
+        if skip:
+            msg += ["", "Пропущены:"] + [f"  {s}" for s in skip[:8]]
+        QMessageBox.information(self, "GostLib", "\n".join(msg))
+        self.log("\n".join(msg))
+
+    def do_reseat_models(self):
+        """
+        Пересчитать вертикальное положение 3D-тел.
+
+        Altium считает Z = 0 плоскостью платы, а модели из EasyEDA
+        приходят с началом координат где придётся: у FBGA-96 геометрия
+        шла от -0.37 мм, и шарики сидели ВНУТРИ платы. Правим только
+        смещение (standoff) -- сами файлы моделей не трогаем.
+        """
+        sel = self.selected_uids()
+        scope = "выделенных" if sel else "всех"
+        if QMessageBox.question(
+                self, "Посадить 3D-модели",
+                f"Пересчитать посадку 3D-тел у {scope} компонентов?\n\n"
+                "Altium считает Z = 0 плоскостью платы, а модели приходят "
+                "с началом координат где придётся — отсюда корпуса, "
+                "утонувшие в плате.\n\n"
+                "Меняется только смещение по высоте. Файлы моделей "
+                "не трогаются: выбранные вручную остаются как есть.\n"
+                "У выводных корпусов посадка не применяется — там ножки "
+                "ниже платы, и это правильно.") != QMessageBox.Yes:
+            return
+        self.setEnabled(False)
+        try:
+            r = self.svc.reseat_models(sel or None)
+        except Exception as e:
+            self.setEnabled(True)
+            QMessageBox.warning(self, "GostLib", f"Не вышло: {e}")
+            return
+        self.setEnabled(True)
+        QMessageBox.information(
+            self, "GostLib",
+            f"Поправлено компонентов: {r['moved']}\n"
+            f"Без изменений: {r['skipped']}\n\n"
+            "Пересоберите библиотеку. Ctrl+Z вернёт как было.")
+        self.on_select()
+
     def do_disk_usage(self):
         """Сколько занимает каждая библиотека -- чтобы не разрастались."""
         info = self.svc.disk_usage()
@@ -1342,11 +1688,16 @@ class MainWindow(QMainWindow):
             f"3D-модели: {_mb(info['models'])}",
             f"Кеш сеток: {_mb(info['mesh_cache'])}",
             f"Задания: {_mb(info['jobs'])}",
+            f"Кеш загрузок: {_mb(info.get('cache', 0))}",
             f"Резервные копии: {_mb(info['backups'])}",
             f"Каталог: {_mb(info['catalog'])}",
             "",
             f"Итого: {_mb(info['total'])}",
         ]
+        if info.get("orphans"):
+            lines += ["",
+                      f"Ссылок на удалённые компоненты: {info['orphans']}"
+                      " — их уберёт «Очистить»"]
         box = QMessageBox(self)
         box.setWindowTitle("Место на диске")
         box.setText("\n".join(lines))
@@ -1359,6 +1710,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "GostLib",
                                     f"Освобождено: {_mb(freed)}")
             self._show_sizes()
+            # счётчики у проектов могли измениться -- обновляем список
+            self.refresh_projects()
+            self.refresh_proj_tree()
 
     def do_projects(self):
         from .dialogs import ProjectsDialog
@@ -1614,6 +1968,9 @@ class MainWindow(QMainWindow):
     def _toggle_comp_numbers(self):
         self._set_own(show_pin_numbers=self.cb_nums.isChecked())
 
+    def _toggle_compact(self):
+        self._set_own(compact_symbols=self.cb_compact.isChecked())
+
     def _set_comp_scale(self, v: int):
         self._set_own(passive_scale=round(v / 100.0, 2))
 
@@ -1647,12 +2004,16 @@ class MainWindow(QMainWindow):
 
     def _show_footprint(self):
         c = self.current
+        self._pending_model = None
+        self.b3d_preview.setEnabled(False)
         if not c or not c.footprints:
             self.fp_view.set_svg("", "посадочного места нет")
             self.fp_info.setPlainText(
                 "У компонента нет посадочного места.\n"
                 "Импортируйте его из KiCad или добавьте вендорскую .PcbLib.")
             self.height_edit.clear()
+            self.mask_edit.clear()
+            self.paste_edit.clear()
             return
         i = self.current_fp_index()
         if i >= len(c.footprints):
@@ -1681,6 +2042,18 @@ class MainWindow(QMainWindow):
         self.model_view.set_model(None, fp, "3D-модели нет")
         self.fp_info.setPlainText("\n".join(lines))
         self.height_edit.setText(f"{fp.height:.2f}" if fp.height else "")
+        # пусто -- «не задано»; ноль -- это именно ноль, а не пусто
+        me = getattr(fp, "mask_expansion", None)
+        pe = getattr(fp, "paste_expansion", None)
+        self.mask_edit.setText("" if me is None else f"{me:g}")
+        self.paste_edit.setText("" if pe is None else f"{pe:g}")
+        self.cb_paste.blockSignals(True)
+        self.cb_paste.setChecked(bool(getattr(fp, "paste", True)))
+        self.cb_paste.blockSignals(False)
+        gi = self.paste_grid.findData(int(getattr(fp, "paste_grid", 0) or 0))
+        self.paste_grid.setCurrentIndex(gi if gi >= 0 else 0)
+        self.paste_over.setText(f"{getattr(fp, 'paste_grid_over', 1.0):g}")
+        self.paste_fill.setText(f"{getattr(fp, 'paste_grid_fill', 60.0):g}")
         tr = getattr(fp.model, "tape_rot", 0.0) if fp.model else 0.0
         self.tape_edit.setText(f"{tr:g}" if tr else "")
         path = fp.model.path if (fp.model and fp.model.path) else ""
@@ -1688,20 +2061,47 @@ class MainWindow(QMainWindow):
             self._start_model_load(path, fp, lines)
 
     # --------------------------------------------- загрузка 3D в фоне ------
-    def _start_model_load(self, path: str, fp, lines):
+    def _start_model_load(self, path: str, fp, lines, force: bool = False):
+        # STEP из EasyEDA хранится для Altium, но превью берём из лежащего
+        # рядом исходного OBJ. Ограничение размера относится именно к тому
+        # файлу, который реально будет прочитан.
+        try:
+            from .. import mesh3d
+            preview_path = mesh3d.preview_source(path)
+        except Exception:
+            preview_path = path
         big = 0
         try:
-            big = os.path.getsize(path)
+            big = os.path.getsize(preview_path)
         except OSError:
             pass
         self._model_lines = list(lines)
         self._model_fp = fp
         # предыдущий разбор мог ещё идти -- его результат нам уже не нужен
         self._model_token = getattr(self, "_model_token", 0) + 1
-        if self._model_loader and self._model_loader.isRunning():
-            self._model_loader.stale = True
+        for loader in tuple(self._model_loaders):
+            if loader.isRunning():
+                loader.stale = True
 
-        name = os.path.basename(path)
+        name = os.path.basename(preview_path)
+        if big > BIG_MODEL and not force:
+            # STEP из EasyEDA может содержать десятки тысяч треугольников.
+            # Даже в QThread чистый Python-парсер долго держит GIL, поэтому
+            # автоматический старт при выборе строки всё равно подвешивает UI.
+            self._pending_model = (path, fp, list(lines))
+            self._queued_model = None
+            self.b3d_preview.setEnabled(True)
+            note = (f"{name} — {big / 1e6:.0f} МБ; "
+                    "автопросмотр отключён")
+            self.model_view.set_model(None, fp, note)
+            self.fp_info.setPlainText("\n".join(lines + ["", (
+                f"3D: {name} ({big / 1e6:.1f} МБ). Модель большая, поэтому "
+                "не разбирается автоматически. Нажмите «Показать тяжёлую "
+                "3D», если превью сейчас необходимо.")]))
+            return
+
+        self._pending_model = None
+        self.b3d_preview.setEnabled(False)
         note = f"{name} — читаю…"
         if big > BIG_MODEL:
             note = (f"{name} — {big / 1e6:.0f} МБ, разбор займёт время; "
@@ -1710,25 +2110,75 @@ class MainWindow(QMainWindow):
         self.fp_info.setPlainText("\n".join(
             lines + ["", f"3D: {name} ({big / 1e6:.1f} МБ) — разбираю…"]))
 
-        self._model_loader = ModelWorker(path, fp, self.cfg.models_dir,
-                                         self._model_token)
-        self._model_loader.done.connect(self._model_ready)
-        self._model_loader.start()
+        # OCCT/trimesh не гарантируют безопасную параллельную загрузку в
+        # двух Python QThread. При быстром выборе следующей строки ждём
+        # окончания старой и запускаем только самый свежий запрос.
+        if any(loader.isRunning() for loader in self._model_loaders):
+            self._queued_model = (path, fp, list(lines), force)
+            self.title_waiting_3d(name)
+            return
+
+        self._queued_model = None
+        loader = ModelWorker(path, fp, self.cfg.models_dir,
+                             self._model_token)
+        self._model_loader = loader
+        self._model_loaders.add(loader)
+        loader.done.connect(self._model_ready)
+        loader.finished.connect(self._model_loader_finished)
+        loader.start()
+
+    def title_waiting_3d(self, name: str):
+        """Коротко показать, что новый просмотр стоит следующим в очереди."""
+        self.model_view.title.setText(f"{name} — ожидает предыдущую 3D…")
+
+    def _model_loader_finished(self):
+        """Не отпускать QThread, пока он действительно не завершился."""
+        loader = self.sender()
+        self._model_loaders.discard(loader)
+        if self._model_loader is loader:
+            self._model_loader = None
+        loader.deleteLater()
+        if not self._model_loaders and self._queued_model:
+            path, fp, lines, force = self._queued_model
+            self._queued_model = None
+            self._start_model_load(path, fp, lines, force=force)
+
+    def _load_pending_model(self):
+        """Явно запустить разбор большой модели, отложенный при выборе."""
+        pending = self._pending_model
+        if not pending:
+            return
+        path, fp, lines = pending
+        self._start_model_load(path, fp, lines, force=True)
 
     def _model_ready(self, token, model, mesh, extra):
         if token != getattr(self, "_model_token", 0):
             return                      # пришёл ответ на устаревший запрос
+        # Берём ЖИВОЕ посадочное место, а не то, что было в момент
+        # запроса. Модель грузится в фоне, и если за это время человек
+        # выбрал цвет, старый объект вернул бы прежний -- цвет на экране
+        # откатывался, хотя в каталоге уже лежал новый.
         fp = self._model_fp
+        cur = self.current
+        if cur is not None and cur.footprints:
+            i = self.current_fp_index()
+            if 0 <= i < len(cur.footprints):
+                fp = cur.footprints[i]
         lines = list(self._model_lines) + [""] + list(extra)
-        if model is not None and getattr(model, "ok", False):
+        if mesh is not None and getattr(mesh, "ok", False):
+            b = mesh.bbox()
+            size = (f"{b[3] - b[0]:.2f}x{b[4] - b[1]:.2f} мм"
+                    if b else "готово")
+            self.model_view.set_model(
+                None, fp, f"{os.path.basename(fp.model.path)} — {size}")
+            self.model_view.scene.set_mesh(mesh)
+        elif model is not None and getattr(model, "ok", False):
             self.model_view.set_model(
                 model, fp, f"{os.path.basename(model.path)} — "
                            f"{model.size()[0]:.2f}x{model.size()[1]:.2f} мм")
         else:
             self.model_view.set_model(
                 None, fp, getattr(model, "error", "") or "модель не читается")
-        if mesh is not None and getattr(mesh, "ok", False):
-            self.model_view.scene.set_mesh(mesh)
         self.fp_info.setPlainText("\n".join(lines))
 
     def do_show_command(self):
@@ -1894,6 +2344,222 @@ class MainWindow(QMainWindow):
             self.current = c
             self._fill_footprints(c)
 
+    def do_set_expansion(self):
+        """
+        Зазоры маски и пасты у ТЕКУЩЕЙ посадки.
+
+        Раньше это была общая настройка на всю библиотеку, и это было
+        неверно: зазор -- свойство корпуса. Пустое поле означает «не
+        задавать», и тогда Altium берёт правило проекта; ноль означает
+        именно ноль.
+        """
+        if not self.current or not self.current.footprints:
+            return
+
+        def num(w, what):
+            s = (w.text() or "").strip().replace(",", ".")
+            if not s:
+                return None, True
+            try:
+                return float(s), True
+            except ValueError:
+                QMessageBox.information(
+                    self, "Зазоры",
+                    f"{what} задаётся числом в миллиметрах "
+                    f"(или пусто — правило проекта)")
+                return None, False
+
+        mask, ok1 = num(self.mask_edit, "Зазор маски")
+        paste, ok2 = num(self.paste_edit, "Зазор пасты")
+        if not (ok1 and ok2):
+            return
+        c = self.svc.set_expansion(self.current.uid, mask, paste,
+                                   self.current_fp_index())
+        if c:
+            self.current = c
+            self._show_footprint()
+            if mask is not None or paste is not None:
+                self.statusBar().showMessage(
+                    "Зазоры сохранены. Пересоберите библиотеку, чтобы они "
+                    "попали в посадочное место", 7000)
+
+    # ------------------------------------------------ текстовая копия ------
+    def _git_dir(self) -> str:
+        """Папка зеркала; при первом обращении спрашиваем и запоминаем."""
+        root = self.svc.git_root()
+        if getattr(self.cfg, "git_dir", ""):
+            return root
+        d = QFileDialog.getExistingDirectory(
+            self, "Папка для текстовой копии библиотеки (её и коммитить)",
+            root)
+        if not d:
+            return ""
+        self.cfg.git_dir = d
+        self.cfg.save()
+        return d
+
+    def do_git_export(self):
+        root = self._git_dir()
+        if not root:
+            return
+        try:
+            r = self.svc.git_export(root,
+                                    with_models=bool(getattr(
+                                        self.cfg, "git_models", False)))
+        except Exception as e:                              # noqa: BLE001
+            QMessageBox.warning(self, "Не выложилось", str(e))
+            return
+        QMessageBox.information(
+            self, "Готово",
+            f"Компонентов: {r['total']}\n"
+            f"Изменено файлов: {len(r['changed'])}\n"
+            f"Удалено: {len(r['removed'])}\n\n"
+            f"Папка: {r['root']}\n\n"
+            f"Дальше как обычно: git add -A, git commit, git push.")
+
+    def do_git_status(self):
+        root = self._git_dir()
+        if not root:
+            return
+        try:
+            st = self.svc.git_status(root)
+        except Exception as e:                              # noqa: BLE001
+            QMessageBox.warning(self, "Не посмотрелось", str(e))
+            return
+
+        def lst(rows):
+            names = [n for _u, n in rows]
+            return ("\n  " + "\n  ".join(names[:12])
+                    + (f"\n  … и ещё {len(names) - 12}"
+                       if len(names) > 12 else "")) if names else " —"
+
+        QMessageBox.information(
+            self, "Сравнение с папкой",
+            f"В каталоге: {st['local_total']}, в папке: "
+            f"{st['remote_total']}\n\n"
+            f"Только у нас:{lst(st['ours'])}\n\n"
+            f"Только в папке:{lst(st['theirs'])}\n\n"
+            f"Расходятся:{lst(st['diff'])}")
+
+    def do_git_import(self, overwrite: bool):
+        root = self._git_dir()
+        if not root:
+            return
+        if overwrite and QMessageBox.question(
+                self, "Взять версию из репозитория",
+                "Компоненты в каталоге будут заменены версиями из папки.\n"
+                "Локальные правки этих компонентов пропадут "
+                "(Ctrl+Z вернёт).\n\nПродолжить?") != QMessageBox.Yes:
+            return
+        try:
+            r = self.svc.git_import(root, overwrite=overwrite)
+        except Exception as e:                              # noqa: BLE001
+            QMessageBox.warning(self, "Не забралось", str(e))
+            return
+        self.refresh_table()
+        QMessageBox.information(
+            self, "Готово",
+            f"Добавлено: {len(r['added'])}\n"
+            f"Обновлено: {len(r['updated'])}\n"
+            f"Пропущено (уже есть): {len(r['skipped'])}")
+
+    def do_git_sync(self):
+        root = self._git_dir()
+        if not root:
+            return
+        try:
+            r = self.svc.git_sync(root,
+                                  with_models=bool(getattr(
+                                      self.cfg, "git_models", False)))
+        except Exception as e:                              # noqa: BLE001
+            QMessageBox.warning(self, "Не синхронизировалось", str(e))
+            return
+        self.refresh_table()
+        msg = (f"Забрано из папки: {len(r['pulled'])}\n"
+               f"Изменено файлов: {r['pushed']}\n")
+        if r["conflicts"]:
+            msg += ("\nРасходятся с репозиторием (выложена НАША версия):\n  "
+                    + "\n  ".join(r["conflicts"][:10])
+                    + "\n\nЧтобы взять чужую — «Взять версию из "
+                      "репозитория».")
+        QMessageBox.information(self, "Синхронизация", msg)
+
+    def do_attach_footprint(self, replace: bool = False):
+        """Дозагрузить (или заменить) посадочное место у компонента."""
+        if not self.current:
+            QMessageBox.information(self, "Посадка",
+                                    "Сначала выберите компонент в списке")
+            return
+        from .dialogs import KicadDialog
+        d = KicadDialog(self.svc, self)
+        d.setWindowTitle("Заменить посадочное место" if replace
+                         else "Дозагрузить посадочное место")
+        # символ здесь не нужен -- берём только посадку
+        d.sym_edit.setEnabled(False)
+        d.sym_list.setEnabled(False)
+        name = (self.current.params.get("KiCadFootprint", "")
+                or self.current.name)
+        d.fp_edit.setText(name)
+        if d.exec() != QDialog.Accepted:
+            return
+        v = d.values()
+        try:
+            c = self.svc.attach_footprint(self.current.uid,
+                                          fp_path=v.get("fp_path", ""),
+                                          fp_ref=v.get("fp_ref", ""),
+                                          replace=replace)
+        except Exception as e:                              # noqa: BLE001
+            QMessageBox.warning(self, "Посадка не добавлена", str(e))
+            return
+        if c:
+            self.current = c
+            self._fill_footprints(c)
+            self.statusBar().showMessage(
+                "Посадка заменена" if replace else "Посадка добавлена", 6000)
+
+    def do_toggle_paste(self, on: bool):
+        """Галочка «наносить пасту» — сразу у всего компонента."""
+        if not self.current or not self.current.footprints:
+            return
+        c = self.svc.set_paste(self.current.uid, bool(on))
+        if c:
+            self.current = c
+            self.statusBar().showMessage(
+                "Паста будет наноситься. Пересоберите библиотеку" if on else
+                "Окон пасты под этот компонент не будет. Пересоберите "
+                "библиотеку", 7000)
+
+    def do_set_paste_grid(self):
+        """Сетка окон пасты у крупных площадок текущей посадки."""
+        if not self.current or not self.current.footprints:
+            return
+
+        def num(w, what, default):
+            s = (w.text() or "").strip().replace(",", ".")
+            if not s:
+                return default, True
+            try:
+                return float(s), True
+            except ValueError:
+                QMessageBox.information(self, "Окно пасты",
+                                        f"{what} задаётся числом")
+                return default, False
+
+        over, ok1 = num(self.paste_over, "Порог", 1.0)
+        fill, ok2 = num(self.paste_fill, "Покрытие", 60.0)
+        if not (ok1 and ok2):
+            return
+        n = int(self.paste_grid.currentData() or 0)
+        c = self.svc.set_paste_grid(self.current.uid, n, over, fill,
+                                    self.current_fp_index())
+        if c:
+            self.current = c
+            self._show_footprint()
+            self.statusBar().showMessage(
+                "Окно пасты сплошное" if n < 2 else
+                f"Сетка {n}×{n} у площадок от {over:g} мм. "
+                f"Пересоберите библиотеку", 7000)
+
     def do_set_height(self):
         if not self.current or not self.current.footprints:
             return
@@ -1916,6 +2582,15 @@ class MainWindow(QMainWindow):
             return
         c = self.svc.set_model_transform(self.current.uid,
                                          self.current_fp_index(), **tr)
+        if c:
+            self.current = c
+
+    def _model_color_changed(self, color: str):
+        """Палитра 3D-вида сразу сохраняется у выбранной модели."""
+        if not self.current or not self.current.footprints:
+            return
+        c = self.svc.set_model_color(self.current.uid, color,
+                                     self.current_fp_index())
         if c:
             self.current = c
 
@@ -1977,9 +2652,38 @@ class MainWindow(QMainWindow):
             else:
                 self.params.setCellWidget(i, 1, None)
                 self.params.setItem(i, 1, QTableWidgetItem(str(val)))
-            u = QTableWidgetItem(p["unit"])
-            u.setFlags(u.flags() & ~Qt.ItemIsEditable)
+            meta = (getattr(c, "param_meta", None) or {}).get(p["key"]) or {}
+            # Единица у своих параметров правится, у справочных -- нет:
+            # там она часть описания типа компонента.
+            own = bool(meta) or p["key"] not in {q["key"] for q
+                                                 in classify.params_for(c.ctype)}
+            u = QTableWidgetItem(str(meta.get("unit", "") or p["unit"]))
+            if not own:
+                u.setFlags(u.flags() & ~Qt.ItemIsEditable)
             self.params.setItem(i, 2, u)
+            tb = QComboBox()
+            for code, ru in self.svc.PARAM_TYPES.items():
+                tb.addItem(ru, code)
+            ti = tb.findData(str(meta.get("type", "str") or "str"))
+            tb.setCurrentIndex(ti if ti >= 0 else 0)
+            tb.setToolTip("Тип нужен для проверки значения: число не "
+                          "должно быть с запятой, ссылка — начинаться "
+                          "с http:// или быть путём к файлу")
+            self.params.setCellWidget(i, 3, tb)
+            vb = QCheckBox()
+            vb.setChecked(bool(meta.get("visible")))
+            vb.setToolTip(
+                "Показывать значение на листе схемы.\n"
+                "По умолчанию выключено: видимый параметр садится в начало "
+                "координат компонента\nи двигать его нечем — видимой должна "
+                "быть одна подпись, Comment.")
+            holder = QWidget()
+            hl = QHBoxLayout(holder)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.addWidget(vb)
+            hl.setAlignment(Qt.AlignCenter)
+            holder.cb = vb
+            self.params.setCellWidget(i, 4, holder)
         self._desig_manual = False
         self.type_box.blockSignals(True)
         idx = self.type_box.findData(c.ctype)
@@ -1999,16 +2703,20 @@ class MainWindow(QMainWindow):
             cb.addItems(ETYPES)
             cb.setCurrentText(p.etype)
             self.pins.setCellWidget(i, 2, cb)
+            unit = QSpinBox()
+            unit.setRange(1, 26)
+            unit.setValue(max(1, int((cur.get(p.number) or p).unit or 1)))
+            self.pins.setCellWidget(i, 3, unit)
             sb = QComboBox()
             sb.addItems(["авто", "L", "R", "T", "B"])
             live = cur.get(p.number)
             manual = bool(live and (live.group or "").startswith("!"))
             sb.setCurrentText(live.side if (manual and live) else "авто")
-            self.pins.setCellWidget(i, 3, sb)
+            self.pins.setCellWidget(i, 4, sb)
             grp = ""
             if manual and live:
                 grp = (live.group or "")[1:]
-            self.pins.setItem(i, 4, QTableWidgetItem(grp))
+            self.pins.setItem(i, 5, QTableWidgetItem(grp))
         self._reset_pin_visual_order()
         self.pins.resizeColumnsToContents()
 
@@ -2076,7 +2784,10 @@ class MainWindow(QMainWindow):
                     try:
                         out += self.svc.import_lcsc(code)
                     except Exception as e:
-                        self.log(f"{code}: {e}")
+                        # job исполняется в QThread. Прямой вызов self.log
+                        # трогал QTextEdit не из GUI-потока и иногда валил
+                        # приложение после пакетного импорта.
+                        self.svc.log(f"{code}: {e}")
                 return out
             self._run(job)
 
@@ -2246,21 +2957,93 @@ class MainWindow(QMainWindow):
         if want != self.desig_edit.text():
             self.desig_edit.setText(want)
 
-    def save_params(self):
+    def do_add_param(self):
+        """Добавить строку под свой параметр."""
         if not self.current:
             return
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(
+            self, "Свой параметр",
+            "Имя параметра (так он и будет называться в Altium):")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if any((self.params.item(i, 0).data(Qt.UserRole) or "").lower()
+               == name.lower() for i in range(self.params.rowCount())):
+            QMessageBox.information(self, "Свой параметр",
+                                    "Такой параметр уже есть в таблице")
+            return
+        i = self.params.rowCount()
+        self.params.insertRow(i)
+        it = QTableWidgetItem(name)
+        it.setData(Qt.UserRole, name)
+        it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+        self.params.setItem(i, 0, it)
+        self.params.setItem(i, 1, QTableWidgetItem(""))
+        self.params.setItem(i, 2, QTableWidgetItem(""))
+        tb = QComboBox()
+        for code, ru in self.svc.PARAM_TYPES.items():
+            tb.addItem(ru, code)
+        self.params.setCellWidget(i, 3, tb)
+        holder = QWidget()
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 0, 0)
+        cb = QCheckBox()
+        hl.addWidget(cb)
+        hl.setAlignment(Qt.AlignCenter)
+        holder.cb = cb
+        self.params.setCellWidget(i, 4, holder)
+        self.params.setCurrentCell(i, 1)
+        self.params.editItem(self.params.item(i, 1))
+
+    def do_del_param(self):
+        i = self.params.currentRow()
+        if i < 0:
+            return
+        self.params.removeRow(i)
+
+    def _param_rows(self):
+        """Снять таблицу параметров: значения и их описание."""
         params: Dict[str, str] = {}
+        meta: Dict[str, dict] = {}
         for i in range(self.params.rowCount()):
             key = self.params.item(i, 0).data(Qt.UserRole)
             w = self.params.cellWidget(i, 1)
             val = w.currentText() if isinstance(w, QComboBox) else (
                 self.params.item(i, 1).text() if self.params.item(i, 1) else "")
-            if str(val).strip():
-                params[key] = str(val).strip()
+            if not str(val).strip():
+                continue
+            params[key] = str(val).strip()
+            tb = self.params.cellWidget(i, 3)
+            holder = self.params.cellWidget(i, 4)
+            unit = (self.params.item(i, 2).text().strip()
+                    if self.params.item(i, 2) else "")
+            kind = tb.currentData() if isinstance(tb, QComboBox) else "str"
+            vis = bool(getattr(holder, "cb", None)
+                       and holder.cb.isChecked())
+            if unit or vis or (kind and kind != "str"):
+                meta[key] = {"type": kind or "str", "unit": unit,
+                             "visible": 1 if vis else 0}
+        return params, meta
+
+    def save_params(self):
+        if not self.current:
+            return
+        params, meta = self._param_rows()
+        bad = [f"{k}: {msg}" for k, v in params.items()
+               if (msg := self.svc.check_param(
+                   v, (meta.get(k) or {}).get("type", "str")))]
+        if bad:
+            if QMessageBox.question(
+                    self, "Проверьте значения",
+                    "Похоже на опечатки:\n\n" + "\n".join(bad[:8])
+                    + "\n\nСохранить как есть?") != QMessageBox.Yes:
+                return
         c = self.svc.apply_params(self.current.uid, params,
                                   self.type_box.currentData(),
                                   self.desig_edit.text().strip(),
-                                  designator_manual=self._desig_manual)
+                                  designator_manual=self._desig_manual,
+                                  meta=meta)
         if c:
             self.current = c
             self.log(f"{c.name}: параметры сохранены")
@@ -2274,8 +3057,9 @@ class MainWindow(QMainWindow):
             "number": self.pins.item(i, 0).text() if self.pins.item(i, 0) else "",
             "name": self.pins.item(i, 1).text() if self.pins.item(i, 1) else "",
             "etype": self.pins.cellWidget(i, 2).currentText(),
-            "side": self.pins.cellWidget(i, 3).currentText(),
-            "group": self.pins.item(i, 4).text() if self.pins.item(i, 4) else "",
+            "unit": self.pins.cellWidget(i, 3).value(),
+            "side": self.pins.cellWidget(i, 4).currentText(),
+            "group": self.pins.item(i, 5).text() if self.pins.item(i, 5) else "",
         }
 
     def _all_pin_rows(self) -> List[dict]:
@@ -2313,11 +3097,15 @@ class MainWindow(QMainWindow):
             cb.addItems(ETYPES)
             cb.setCurrentText(r["etype"])
             self.pins.setCellWidget(i, 2, cb)
+            unit = QSpinBox()
+            unit.setRange(1, 26)
+            unit.setValue(max(1, int(r.get("unit", 1) or 1)))
+            self.pins.setCellWidget(i, 3, unit)
             sb = QComboBox()
             sb.addItems(["авто", "L", "R", "T", "B"])
             sb.setCurrentText(r["side"] or "авто")
-            self.pins.setCellWidget(i, 3, sb)
-            self.pins.setItem(i, 4, QTableWidgetItem(r["group"]))
+            self.pins.setCellWidget(i, 4, sb)
+            self.pins.setItem(i, 5, QTableWidgetItem(r["group"]))
         self.pins.clearSelection()
         for i in select:
             if 0 <= i < len(rows):
@@ -2363,6 +3151,52 @@ class MainWindow(QMainWindow):
             self.log(f"{c.name}: раскладка применена — порядок {order}"
                      + (" …" if len(rows) > 12 else ""))
             self.on_select()
+
+    def ai_pin_plan(self):
+        """Открыть текстовый обмен раскладкой с внешней ИИ."""
+        if not self.current:
+            return
+        dialog = PinPlanDialog(self.current, self)
+        if dialog.exec() != QDialog.Accepted or dialog.rows is None:
+            return
+        c = self.svc.apply_pins(self.current.uid, dialog.rows,
+                                reset_geometry=True)
+        if c:
+            self.current = c
+            sections = max([int(r.get("unit", 1)) for r in dialog.rows] or [1])
+            self.log(f"{c.name}: ИИ-раскладка применена — "
+                     f"выводов {len(dialog.rows)}, секций {sections}")
+            self.on_select()
+
+    def tidy_pins(self):
+        """
+        Привести раскладку в порядок без всякого ИИ.
+
+        Берём то, что сейчас в таблице выводов, и раскладываем по тем же
+        правилам, что применяются после ответа модели: питание и земля --
+        в свои секции, стороны выровнены, длинные столбики разбиты.
+        """
+        if not self.current:
+            return
+        from ..pinplan import tidy
+        rows = self._all_pin_rows()
+        if not rows:
+            return
+        rows, notes = tidy(rows)
+        c = self.svc.apply_pins(self.current.uid, rows, reset_geometry=True)
+        if not c:
+            return
+        self.current = c
+        sections = max([int(r.get("unit", 1)) for r in rows] or [1])
+        self.log(f"{c.name}: раскладка приведена в порядок — "
+                 f"выводов {len(rows)}, секций {sections}")
+        for n in notes:
+            self.log(f"  {n}")
+        self.on_select()
+        QMessageBox.information(
+            self, "Раскладка приведена в порядок",
+            ("Что поправлено:\n\n  • " + "\n  • ".join(notes[:10]))
+            if notes else "Всё и так было в порядке — менять нечего.")
 
     def reset_pins(self):
         if not self.current:
@@ -2513,8 +3347,18 @@ class MainWindow(QMainWindow):
         m.exec(self.table.viewport().mapToGlobal(pos))
 
     def closeEvent(self, e):
+        self._queued_model = None
+        for loader in tuple(getattr(self, "_model_loaders", ())):
+            loader.stale = True
+            loader.requestInterruption()
+        worker = getattr(self, "_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(3000)
         try:
-            self.svc.close()
+            # Базу нельзя закрывать под ещё работающим импортом.
+            if worker is None or not worker.isRunning():
+                self.svc.close()
         except Exception:
             pass
         e.accept()

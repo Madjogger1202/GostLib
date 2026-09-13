@@ -200,6 +200,8 @@ class Catalog:
                               ).fetchone()["n"]
         self.conn.execute("DELETE FROM params")
         self.conn.execute("DELETE FROM components")
+        # каталог пуст -- значит и все ссылки проектов повисли
+        self.conn.execute("DELETE FROM project_items")
         self.conn.commit()
         try:
             self.conn.execute("VACUUM")
@@ -209,10 +211,42 @@ class Catalog:
 
     # ---------------------------------------------------------- проекты ----
     def projects(self) -> List[sqlite3.Row]:
+        """
+        Проекты со ЖИВЫМ числом компонентов.
+
+        Ссылка на удалённый компонент в project_items остаётся намеренно:
+        по ней Ctrl+Z возвращает не только сам компонент, но и его место в
+        проекте. Но считать такие ссылки нельзя -- иначе счётчик только
+        растёт: в проекте два компонента, а рядом написано девять, потому
+        что семь когда-то удалили.
+        """
         return list(self.conn.execute(
             "SELECT p.*, (SELECT COUNT(*) FROM project_items i "
+            "             JOIN components c ON c.uid = i.uid "
             "             WHERE i.project_id = p.id) AS n "
             "FROM projects p ORDER BY p.name"))
+
+    def orphan_items(self) -> int:
+        """Сколько ссылок указывают на уже удалённые компоненты."""
+        return int(self.conn.execute(
+            "SELECT COUNT(*) n FROM project_items i "
+            "WHERE NOT EXISTS (SELECT 1 FROM components c WHERE c.uid=i.uid)"
+        ).fetchone()["n"])
+
+    def purge_orphans(self) -> int:
+        """
+        Убрать ссылки на удалённые компоненты.
+
+        Вызывается при чистке каталога и из «Место на диске»: пока не
+        вызвали, ссылки лежат и позволяют отменить удаление.
+        """
+        n = self.orphan_items()
+        if n:
+            self.conn.execute(
+                "DELETE FROM project_items WHERE uid NOT IN "
+                "(SELECT uid FROM components)")
+            self.conn.commit()
+        return n
 
     def project(self, pid: int) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM projects WHERE id=?",

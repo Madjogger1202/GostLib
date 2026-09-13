@@ -20,8 +20,9 @@ from typing import List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
-from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QPushButton,
-                               QSizePolicy, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox,
+                               QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+                               QVBoxLayout, QWidget)
 
 Point = Tuple[float, float, float]
 
@@ -51,11 +52,13 @@ class Scene3D(QWidget):
         self.faces: List[List[Point]] = []
         self.edges: List[Tuple[Point, Point]] = []
         self.points: List[Point] = []
-        self.pads: List[Tuple[float, float, float, float]] = []
+        # контуры площадок в мм: список точек на каждую
+        self.pads: List[List[Tuple[float, float]]] = []
         self.outline: List[Tuple[float, float, float, float]] = []
         # трансформация модели относительно посадочного места
         self.tr = dict(dx=0.0, dy=0.0, dz=0.0, rx=0.0, ry=0.0, rz=0.0)
         self.color = (0.62, 0.64, 0.68)   # цвет корпуса, доли 0..1
+        self.override_color = None         # выбранный пользователем цвет
         self.tri_colors: List[Tuple[float, float, float]] = []
         self.smooth = False               # сетка мелкая -- контур не рисуем
         self.board = True
@@ -74,6 +77,7 @@ class Scene3D(QWidget):
         self._pl_cent = []        # центры граней -- для сортировки по глубине
         self._pl_col = []         # готовый QColor каждой грани
         self._pl_nrm = []         # нормали -- по ним отбрасываем изнанку
+        self._model_bounds = None  # min/max уже преобразованной модели
         self._busy = False        # идёт перетаскивание -- рисуем упрощённо
         self.setMinimumSize(240, 200)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -84,10 +88,29 @@ class Scene3D(QWidget):
         self.smooth = bool(mesh is not None and getattr(mesh, "ok", False)
                            and len(mesh.tris) > 400)
         if mesh is not None and getattr(mesh, "ok", False):
-            self.faces = [list(t) for t in mesh.tris]
-            self.tri_colors = list(mesh.colors)
+            tris = list(mesh.tris)
+            cols = list(mesh.colors)
+            # Последний предохранитель для чужих OBJ/STL. Обычно mesh3d
+            # заранее упрощает поверхность без дыр, но GUI никогда не должен
+            # получить десятки тысяч полигонов и подвиснуть при движении.
+            if len(tris) > MAX_FACES:
+                step = len(tris) / float(MAX_FACES)
+                take = [int(i * step) for i in range(MAX_FACES)]
+                tris = [tris[i] for i in take]
+                cols = [cols[i] for i in take if i < len(cols)]
+            self.faces = [list(t) for t in tris]
+            self.tri_colors = cols
             self.edges = []
             self.points = []
+            self._cache_key = None
+        self.update()
+
+    def set_color(self, value: str = ""):
+        """Задать цвет корпуса для просмотра; пусто = материал модели."""
+        q = QColor(value) if value else QColor()
+        self.override_color = ((q.redF(), q.greenF(), q.blueF())
+                               if q.isValid() else None)
+        self._cache_key = None
         self.update()
 
     def set_model(self, model=None, fp=None):
@@ -117,8 +140,17 @@ class Scene3D(QWidget):
             else:
                 self.color = (0.62, 0.64, 0.68)
         if fp is not None:
+            # Площадка -- это её настоящий контур, а не габаритный
+            # прямоугольник: овал, восьмиугольник и поворот раньше
+            # терялись, и картинка расходилась с посадкой.
+            from ..ir import pad_polygon
             for p in getattr(fp, "pads", []):
-                self.pads.append((p.x - p.w / 2, p.y - p.h / 2, p.w, p.h))
+                try:
+                    self.pads.append(pad_polygon(p))
+                except Exception:
+                    hw, hh = p.w / 2.0, p.h / 2.0
+                    self.pads.append([(p.x - hw, p.y - hh), (p.x + hw, p.y - hh),
+                                      (p.x + hw, p.y + hh), (p.x - hw, p.y + hh)])
             for pr in getattr(fp, "prims", []):
                 if pr.layer not in ("courtyard", "assy"):
                     continue
@@ -135,6 +167,12 @@ class Scene3D(QWidget):
             if m is not None:
                 self.tr = dict(dx=m.dx, dy=m.dy, dz=m.dz,
                                rx=m.rx, ry=m.ry, rz=m.rz)
+                self.set_color(getattr(m, "color", ""))
+            else:
+                self.set_color("")
+        else:
+            self.set_color("")
+        self._cache_key = None
         self.reset_view()
 
     def reset_view(self):
@@ -197,15 +235,20 @@ class Scene3D(QWidget):
         """
         t = self.tr
         key = (id(self.faces), len(self.faces), t["rx"], t["ry"], t["rz"],
-               t["dx"], t["dy"], t["dz"], self.smooth, len(self.tri_colors))
+               t["dx"], t["dy"], t["dz"], self.smooth,
+               len(self.tri_colors), self.override_color)
         if key == self._cache_key:
             return
         self._cache_key = key
         faces, cents, cols, nrms = [], [], [], []
-        base = self.color
+        base = self.override_color or self.color
+        xs, ys, zs = [], [], []
         for i, f in enumerate(self.faces):
             pf = [self._place(v) for v in f]
             faces.append(pf)
+            xs.extend(v[0] for v in pf)
+            ys.extend(v[1] for v in pf)
+            zs.extend(v[2] for v in pf)
             n = len(pf)
             cents.append((sum(v[0] for v in pf) / n,
                           sum(v[1] for v in pf) / n,
@@ -213,16 +256,32 @@ class Scene3D(QWidget):
             # Цвет части модели плюс диффузная подсветка сверху-сбоку:
             # грани разной ориентации получают разную яркость, и тело
             # читается как объём.
-            bc = self.tri_colors[i] if i < len(self.tri_colors) else base
+            bc = (base if self.override_color is not None else
+                  (self.tri_colors[i]
+                   if i < len(self.tri_colors) else base))
             nv = _normal(pf)
-            lit = 0.34 + 0.44 * abs(nv[2]) + 0.22 * abs(nv[0])
-            lit = max(0.18, min(1.0, lit))
+            # QPainter не умеет интерполировать нормали внутри полигона.
+            # Непрерывная формула поэтому проявляла диагонали исходной OBJ
+            # как «сетку». Для почти плоских граней используем один тон, а
+            # промежуточный оставляем скруглениям и фаскам.
+            ax, ay, az = abs(nv[0]), abs(nv[1]), abs(nv[2])
+            if nv[2] > 0.15:
+                lit = 0.96
+            elif ax >= 0.82:
+                lit = 0.76
+            elif ay >= 0.82:
+                lit = 0.84
+            else:
+                lit = 0.88
             cols.append(QColor(min(255, int(255 * bc[0] * lit)),
                                min(255, int(255 * bc[1] * lit)),
                                min(255, int(255 * bc[2] * lit))))
             nrms.append(nv)
         self._pl_faces, self._pl_cent = faces, cents
         self._pl_col, self._pl_nrm = cols, nrms
+        self._model_bounds = ((min(xs), min(ys), min(zs),
+                               max(xs), max(ys), max(zs))
+                              if xs else None)
 
     def _model_polys(self):
         self._prepare()
@@ -236,15 +295,17 @@ class Scene3D(QWidget):
         pts = [self._place(v) for v in self.points]
 
         xs, ys, zs = [], [], []
-        for f in polys:
-            for v in f:
-                xs.append(v[0]); ys.append(v[1]); zs.append(v[2])
+        if self._model_bounds:
+            x1, y1, z1, x2, y2, z2 = self._model_bounds
+            xs += [x1, x2]; ys += [y1, y2]; zs += [z1, z2]
         for a, b in edges:
             xs += [a[0], b[0]]; ys += [a[1], b[1]]; zs += [a[2], b[2]]
         for v in pts:
             xs.append(v[0]); ys.append(v[1]); zs.append(v[2])
-        for (x, y, w, h) in self.pads:
-            xs += [x, x + w]; ys += [y, y + h]; zs.append(0.0)
+        for poly in self.pads:
+            for (px, py) in poly:
+                xs.append(px); ys.append(py)
+            zs.append(0.0)
         for (x1, y1, x2, y2) in self.outline:
             xs += [x1, x2]; ys += [y1, y2]
         if not xs:
@@ -298,11 +359,9 @@ class Scene3D(QWidget):
         if self.show_pads:
             p.setPen(QPen(QColor("#e0c060"), 1))
             p.setBrush(QColor(212, 176, 84))
-            for (x, y, pw, ph) in self.pads:
-                p.drawPolygon(QPolygonF([proj((x, y, 0.0)),
-                                         proj((x + pw, y, 0.0)),
-                                         proj((x + pw, y + ph, 0.0)),
-                                         proj((x, y + ph, 0.0))]))
+            for poly in self.pads:
+                p.drawPolygon(QPolygonF([proj((px, py, 0.0))
+                                         for px, py in poly]))
             p.setBrush(Qt.NoBrush)
             p.setPen(QPen(QColor("#8a6f2a"), 1))
             for (x1, y1, x2, y2) in self.outline:
@@ -310,6 +369,11 @@ class Scene3D(QWidget):
 
         # --- корпус
         if polys and not self.wire:
+            # Антиалиасинг каждого треугольника отдельно оставляет между
+            # соседями полупрозрачные швы — визуально получается сетка.
+            # Контур всего тела при тысячах мелких граней и без него гладкий.
+            if self.smooth:
+                p.setRenderHint(QPainter.Antialiasing, False)
             cents = self._pl_cent
             cols = self._pl_col
             nrms = self._pl_nrm
@@ -374,6 +438,16 @@ class Model3DPane(QWidget):
     """Сцена, виды и правка положения модели относительно посадки."""
 
     transform_changed = Signal(dict)
+    color_changed = Signal(str)
+
+    COLORS = (
+        ("цвет модели", ""),
+        ("серый", "#9EA3AD"),
+        ("чёрный", "#34383F"),
+        ("зелёный", "#4C805D"),
+        ("синий", "#4B72A8"),
+        ("керамика", "#D0C3A0"),
+    )
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -394,6 +468,21 @@ class Model3DPane(QWidget):
         bar.addWidget(self.cb_board)
         bar.addWidget(self.cb_pads)
         bar.addWidget(self.cb_wire)
+        self.color_pick = QComboBox()
+        self.color_pick.setToolTip(
+            "Цвет корпуса. Пишется и в сам файл модели, поэтому в Altium\n"
+            "корпус будет такого же цвета. «родной» — вернуть цвета,\n"
+            "которые были в исходной модели. Файл, выбранный руками,\n"
+            "не трогается.")
+        for name, value in self.COLORS:
+            self.color_pick.addItem(name, value)
+        self.color_pick.currentIndexChanged.connect(self._pick_color)
+        bar.addWidget(self.color_pick)
+        rgb = QPushButton("RGB…")
+        rgb.setToolTip("Выбрать произвольный цвет корпуса")
+        rgb.setFixedHeight(22)
+        rgb.clicked.connect(self._choose_rgb)
+        bar.addWidget(rgb)
         for txt, fn in (("сверху", self.scene.top_view),
                         ("сбоку", self.scene.side_view),
                         ("3D", self.scene.reset_view)):
@@ -442,6 +531,27 @@ class Model3DPane(QWidget):
         self.scene.wire = self.cb_wire.isChecked()
         self.scene.update()
 
+    def _pick_color(self, index: int):
+        value = self.color_pick.itemData(index) or ""
+        self.scene.set_color(value)
+        self.color_changed.emit(value)
+
+    def _choose_rgb(self):
+        current = (QColor.fromRgbF(*self.scene.override_color)
+                   if self.scene.override_color else QColor("#9EA3AD"))
+        q = QColorDialog.getColor(current, self, "Цвет 3D-модели")
+        if not q.isValid():
+            return
+        value = q.name(QColor.HexRgb).upper()
+        self.color_pick.blockSignals(True)
+        while self.color_pick.count() > len(self.COLORS):
+            self.color_pick.removeItem(self.color_pick.count() - 1)
+        self.color_pick.addItem(f"свой {value}", value)
+        self.color_pick.setCurrentIndex(self.color_pick.count() - 1)
+        self.color_pick.blockSignals(False)
+        self.scene.set_color(value)
+        self.color_changed.emit(value)
+
     def _bump(self, key: str, delta: float):
         t = self.scene.tr
         if key.startswith("r"):
@@ -459,3 +569,21 @@ class Model3DPane(QWidget):
     def set_model(self, model=None, fp=None, subtitle: str = ""):
         self.scene.set_model(model, fp)
         self.title.setText(subtitle or "3D-модель")
+        value = ""
+        if fp is not None and getattr(fp, "model", None) is not None:
+            value = getattr(fp.model, "color", "") or ""
+        found = next((i for i, (_name, col) in enumerate(self.COLORS)
+                      if col.upper() == value.upper()), -1)
+        self.color_pick.blockSignals(True)
+        while self.color_pick.count() > len(self.COLORS):
+            self.color_pick.removeItem(self.color_pick.count() - 1)
+        if value and found < 0:
+            self.color_pick.addItem(f"свой {value}", value)
+            found = self.color_pick.count() - 1
+        self.color_pick.setCurrentIndex(max(0, found))
+        self.color_pick.setToolTip(
+            "Цвет корпуса. Пишется и в сам файл модели, поэтому в Altium\n"
+            "корпус будет такого же цвета. «родной» — вернуть цвета,\n"
+            "которые были в исходной модели. Файл, выбранный руками,\n"
+            "не трогается.")
+        self.color_pick.blockSignals(False)

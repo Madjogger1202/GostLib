@@ -886,4 +886,24 @@ def resolve_3d(model_path: str, subst: Optional[Dict[str, str]] = None) -> str:
     for ext in (".step", ".stp", ".STEP", ".STP"):
         if os.path.isfile(stem + ext):
             return stem + ext
-    return p if os.path.isfile(p) else ""
+    if os.path.isfile(p):
+        return p
+    # Переменную развернуть не удалось (её нет ни в окружении, ни в
+    # настройках KiCad -- так бывает при портативной установке). Ищем файл
+    # по хвосту пути в найденных установках: «...3dshapes/R_0402.step»
+    # лежит там же, где symbols и footprints, которые мы уже нашли.
+    tail = re.sub(r"^\$\{[^}]+\}[\\/]*", "", (model_path or "").strip())
+    tail = tail.replace("\\", "/").lstrip("/")
+    if not tail:
+        return ""
+    for root in install_roots():
+        for sub in ("3dmodels", ""):
+            cand = os.path.join(root, sub, *tail.split("/")) if sub \
+                else os.path.join(root, *tail.split("/"))
+            if os.path.isfile(cand):
+                return cand
+            stem = os.path.splitext(cand)[0]
+            for ext in (".step", ".stp", ".STEP", ".STP"):
+                if os.path.isfile(stem + ext):
+                    return stem + ext
+    return ""

@@ -13,6 +13,7 @@ SVG-превью, запись в каталог и задание для Altium
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
@@ -132,10 +133,11 @@ class PartGeom:
             d = sym.parts.get(key)
             if d is None:
                 d = {"body_w": 0, "body_h": 0, "field_l": 0, "field_r": 0,
-                     "dividers": [], "user_lines": []}
+                     "dividers": [], "user_lines": [], "user_shapes": []}
                 sym.parts[key] = d
             d.setdefault("dividers", [])
             d.setdefault("user_lines", [])
+            d.setdefault("user_shapes", [])
             self._d = d
 
     @property
@@ -182,6 +184,19 @@ class Symbol:
     dividers: List[int] = field(default_factory=list)  # y горизонтальных линий
     # произвольные линии, нарисованные в редакторе: [x1, y1, x2, y2]
     user_lines: List[List[int]] = field(default_factory=list)
+    # Остальная графика редактора: дуги, окружности, прямоугольники,
+    # ломаные и полигоны. Отдельным списком, а не пятым элементом в
+    # user_lines, чтобы старые компоненты читались слово в слово.
+    # Каждая фигура -- словарь:
+    #   kind : 'arc' | 'circle' | 'rect' | 'poly'
+    #   pts  : [[x, y], ...]  (центр для arc/circle, углы для rect,
+    #                          вершины для poly), mil
+    #   r    : радиус, mil (arc/circle)
+    #   a1,a2: углы дуги в градусах против часовой (arc)
+    #   w    : толщина линии 1..3, col: цвет (-1 -- общий),
+    #   fill : заливка (rect/poly), 0/1
+    #   close: замкнуть ломаную (poly), 0/1
+    user_shapes: List[Dict[str, Any]] = field(default_factory=list)
 
     # Секции 2..N: своя геометрия у каждой. Поля выше -- это секция 1,
     # поэтому старые компоненты читаются без переделки. Ключ -- номер
@@ -192,7 +207,7 @@ class Symbol:
 
     # Поля геометрии, которые у каждой секции свои.
     GEOM = ("body_w", "body_h", "field_l", "field_r", "dividers",
-            "user_lines")
+            "user_lines", "user_shapes")
 
     def geom(self, part: int = 1) -> Dict[str, Any]:
         """Геометрия секции. Секция 1 -- поля самого символа."""
@@ -207,6 +222,7 @@ class Symbol:
             "field_r": int(d.get("field_r", 0) or 0),
             "dividers": list(d.get("dividers", []) or []),
             "user_lines": [list(l) for l in (d.get("user_lines") or [])],
+            "user_shapes": [dict(x) for x in (d.get("user_shapes") or [])],
         }
 
     def set_geom(self, part: int, **kw) -> None:
@@ -263,6 +279,126 @@ class Pad:
     mask_expansion: Optional[float] = None
     paste_expansion: Optional[float] = None
 
+    def slot_rot(self) -> float:
+        """
+        Угол паза с поправкой на заведомо невозможный.
+
+        Отверстие обязано помещаться в площадку. Если паз длиной 1,3 мм
+        объявлен вдоль X у площадки шириной 1,1 мм, а по Y там 1,9 мм --
+        это не «странная посадка», а потерянный угол: так приезжали
+        крепёжные пазы разъёмов USB-C из EasyEDA, где угол лежит в
+        отдельном поле и раньше не читался. Поворачиваем на 90 градусов
+        только когда вдоль объявленного направления паз не помещается, а
+        поперёк -- помещается: гадания тут нет, есть геометрия.
+        """
+        rot = float(self.hole_rot or 0.0)
+        ln = abs(float(self.hole_len or 0.0))
+        if ln <= abs(float(self.hole or 0.0)) + 1e-9:
+            return rot                      # круглое отверстие
+        a = math.radians(rot - float(self.rot or 0.0))
+        along = abs(self.w * math.cos(a)) + abs(self.h * math.sin(a))
+        across = abs(self.w * math.sin(a)) + abs(self.h * math.cos(a))
+        if ln > along + 1e-6 and ln <= across + 1e-6:
+            return rot + 90.0
+        return rot
+
+
+def pad_polygon(pad: "Pad", seg: int = 6) -> List[Tuple[float, float]]:
+    """
+    Контур площадки в мм, с учётом формы и поворота.
+
+    Нужен и превью, и просмотру 3D: раньше каждый рисовал по-своему и
+    приблизительно -- овал выходил эллипсом, восьмиугольник
+    прямоугольником, поворот в 3D терялся вовсе. Настоящий овал (obround)
+    -- это прямоугольник с полукруглыми торцами, а не эллипс: у него
+    прямые борта, и на плотной плате разница видна.
+
+    `seg` -- сколько отрезков на четверть окружности.
+    """
+    import math as _m
+
+    w = abs(float(pad.w or 0)) or 0.001
+    h = abs(float(pad.h or 0)) or 0.001
+    hw, hh = w / 2.0, h / 2.0
+    shape = (pad.shape or "rect").lower()
+
+    def arc(cx, cy, r, a0, a1, n):
+        return [(cx + r * _m.cos(a0 + (a1 - a0) * i / n),
+                 cy + r * _m.sin(a0 + (a1 - a0) * i / n))
+                for i in range(n + 1)]
+
+    pts: List[Tuple[float, float]] = []
+    if shape == "round":
+        n = max(8, seg * 4)
+        pts = [(hw * _m.cos(2 * _m.pi * i / n), hh * _m.sin(2 * _m.pi * i / n))
+               for i in range(n)]
+    elif shape == "octagon":
+        # правильный восьмиугольник, вписанный в габарит площадки
+        k = 0.5 * (2 ** 0.5 - 1) * 2      # доля скоса, ~0.414 от половины
+        ax, ay = hw * k, hh * k
+        pts = [(-hw + ax, -hh), (hw - ax, -hh), (hw, -hh + ay), (hw, hh - ay),
+               (hw - ax, hh), (-hw + ax, hh), (-hw, hh - ay), (-hw, -hh + ay)]
+    elif shape in ("oval", "obround", "stadium"):
+        r = min(hw, hh)
+        if w >= h:                      # торцы слева и справа
+            cx = hw - r
+            pts = arc(cx, 0.0, r, -_m.pi / 2, _m.pi / 2, seg * 2)
+            pts += arc(-cx, 0.0, r, _m.pi / 2, 3 * _m.pi / 2, seg * 2)
+        else:                           # торцы сверху и снизу
+            cy = hh - r
+            pts = arc(0.0, cy, r, 0.0, _m.pi, seg * 2)
+            pts += arc(0.0, -cy, r, _m.pi, 2 * _m.pi, seg * 2)
+    elif shape == "roundrect":
+        frac = float(pad.corner_radius or 0) / 100.0
+        r = max(0.0, min(frac * min(w, h), min(hw, hh)))
+        if r <= 1e-9:
+            pts = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+        else:
+            pts = arc(hw - r, hh - r, r, 0.0, _m.pi / 2, seg)
+            pts += arc(-hw + r, hh - r, r, _m.pi / 2, _m.pi, seg)
+            pts += arc(-hw + r, -hh + r, r, _m.pi, 3 * _m.pi / 2, seg)
+            pts += arc(hw - r, -hh + r, r, 3 * _m.pi / 2, 2 * _m.pi, seg)
+    else:                               # rect и всё незнакомое
+        pts = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+
+    a = math.radians(float(pad.rot or 0))
+    if abs(a) > 1e-12:
+        ca, sa = math.cos(a), math.sin(a)
+        pts = [(x * ca - y * sa, x * sa + y * ca) for x, y in pts]
+    return [(pad.x + x, pad.y + y) for x, y in pts]
+
+
+def hole_polygon(pad: "Pad", seg: int = 8) -> List[Tuple[float, float]]:
+    """
+    Контур отверстия. Паз -- это стадион, а не круг: у KiCad овальные
+    отверстия крепёжных площадок вытянуты, и кругом они рисовались вдвое
+    короче настоящего.
+    """
+    import math as _m
+
+    d = abs(float(pad.hole or 0))
+    if d <= 0:
+        return []
+    ln = abs(float(pad.hole_len or 0))
+    r = d / 2.0
+    if ln <= d + 1e-9:
+        n = max(10, seg * 3)
+        pts = [(r * _m.cos(2 * _m.pi * i / n), r * _m.sin(2 * _m.pi * i / n))
+               for i in range(n)]
+    else:
+        c = ln / 2.0 - r
+        pts = [(c + r * _m.cos(-_m.pi / 2 + _m.pi * i / (seg * 2)),
+                r * _m.sin(-_m.pi / 2 + _m.pi * i / (seg * 2)))
+               for i in range(seg * 2 + 1)]
+        pts += [(-c + r * _m.cos(_m.pi / 2 + _m.pi * i / (seg * 2)),
+                 r * _m.sin(_m.pi / 2 + _m.pi * i / (seg * 2)))
+                for i in range(seg * 2 + 1)]
+    a = math.radians(pad.slot_rot())
+    if abs(a) > 1e-12:
+        ca, sa = math.cos(a), math.sin(a)
+        pts = [(x * ca - y * sa, x * sa + y * ca) for x, y in pts]
+    return [(pad.x + x, pad.y + y) for x, y in pts]
+
 
 @dataclass
 class FpPrim:
@@ -290,6 +426,7 @@ class Model3D:
     rx: float = 0.0
     ry: float = 0.0
     rz: float = 0.0
+    color: str = ""             # '#RRGGBB'; пусто -- родные цвета модели
 
 
 def short_fp_name(name: str, limit: int = 31) -> str:
@@ -314,6 +451,31 @@ class Footprint:
     prims: List[FpPrim] = field(default_factory=list)
     height: float = 0.0
     model: Optional[Model3D] = None
+    # Зазоры паяльной маски и трафарета пасты, мм на сторону, на ВСЕ
+    # площадки этой посадки. None -- не задавать: Altium возьмёт правило
+    # проекта. Место им именно здесь, а не в общих настройках: зазор --
+    # свойство корпуса (у BGA один, у QFN с тепловым пятном другой), и
+    # одно значение на всю библиотеку смысла не имеет.
+    mask_expansion: Optional[float] = None
+    paste_expansion: Optional[float] = None
+    # Нужна ли этому корпусу паста вообще. False -- окон в трафарете не
+    # будет: так делают у разъёмов под запрессовку, у тестовых пятаков, у
+    # экранов, которые паяют вручную. В Altium это отдельной галочки в
+    # скрипте нет, поэтому окно закрывается заведомо отрицательным
+    # зазором по размеру самой площадки -- в свойствах видно как
+    # «Manual Expansion» с большим минусом, окна пасты нет.
+    paste: bool = True
+    # Окно пасты сеткой («windowpane») у КРУПНЫХ площадок -- тепловых
+    # пятаков QFN, площадок силовых транзисторов. Сплошное окно на такой
+    # площадке даёт слишком много пасты: деталь всплывает, шарики BGA
+    # рядом уходят в короткое. Штатное решение -- разбить окно на
+    # квадратики и накрыть ими только часть площади.
+    #   paste_grid      -- 0 (выкл) или N: сетка N x N
+    #   paste_grid_over -- порог, мм: сетка ставится площадкам крупнее
+    #   paste_grid_fill -- сколько процентов площади накрыть пастой
+    paste_grid: int = 0
+    paste_grid_over: float = 1.0
+    paste_grid_fill: float = 60.0
     # если посадка берётся готовой из чужой Altium-библиотеки:
     source_pcblib: str = ""
     source_name: str = ""
@@ -338,6 +500,13 @@ class Component:
     symbol: Symbol = field(default_factory=Symbol)
     footprints: List[Footprint] = field(default_factory=list)
     params: Dict[str, str] = field(default_factory=dict)
+    # Описание параметров: тип, единица и показывать ли на схеме.
+    # Ключ -- имя параметра из `params`. Отдельным словарём, а не заменой
+    # `params`, чтобы старые компоненты читались как есть, а параметры без
+    # описания вели себя ровно как раньше (текст, скрытый).
+    #   {"ТокНагрузки": {"type": "num", "unit": "А", "visible": 0}}
+    # type: str | num | url | date
+    param_meta: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     tags: List[str] = field(default_factory=list)
     notes: str = ""
     created: str = ""
@@ -382,6 +551,7 @@ class Component:
             field_r=int(sym.get("field_r", 0) or 0),
             dividers=list(sym.get("dividers", []) or []),
             user_lines=[list(l) for l in (sym.get("user_lines") or [])],
+            user_shapes=[dict(x) for x in (sym.get("user_shapes") or [])],
             parts={str(k): dict(v) for k, v in
                    (sym.get("parts") or {}).items()},
         )
@@ -397,6 +567,12 @@ class Component:
                 model=Model3D(**m) if m else None,
                 source_pcblib=f.get("source_pcblib", ""),
                 source_name=f.get("source_name", ""),
+                mask_expansion=f.get("mask_expansion"),
+                paste_expansion=f.get("paste_expansion"),
+                paste=bool(f.get("paste", True)),
+                paste_grid=int(f.get("paste_grid", 0) or 0),
+                paste_grid_over=float(f.get("paste_grid_over", 1.0) or 1.0),
+                paste_grid_fill=float(f.get("paste_grid_fill", 60.0) or 60.0),
             ))
         c = Component(
             uid=d.get("uid") or uuid.uuid4().hex[:12],
@@ -413,6 +589,8 @@ class Component:
             symbol=symbol,
             footprints=fps,
             params=dict(d.get("params", {})),
+            param_meta={str(k): dict(v) for k, v in
+                        (d.get("param_meta") or {}).items()},
             tags=list(d.get("tags", [])),
             notes=d.get("notes", ""),
             style_over=dict(d.get("style_over", {}) or {}),

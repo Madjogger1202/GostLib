@@ -143,6 +143,21 @@ class Service:
         self._adopt_into_project(out)
         return out
 
+    def _snap(self, uid: str, title: str) -> None:
+        """
+        Запомнить компонент до изменения -- одним законченным шагом отмены.
+
+        Раньше половина методов звала `undo.touch()` без открытого шага, а
+        `touch()` вне шага не делает НИЧЕГО. То есть Ctrl+Z молча не
+        работал для переименования, раскладки выводов, правки УГО, смены
+        модели и зазоров -- при том, что в интерфейсе про отмену
+        написано. Шаг закрывается сразу: снимок берётся ДО правки, а
+        откат сам запоминает встречное состояние.
+        """
+        self.undo.begin(title)
+        self.undo.touch(uid)
+        self.undo.end()
+
     def _adopt_into_project(self, comps: List[Component]) -> int:
         """
         Свежий импорт сразу входит в текущий проект.
@@ -166,6 +181,159 @@ class Service:
             self.log(f"  → в проект «{pr['name']}»: {n}")
         return n
 
+    _ZCACHE: Dict[str, object] = {}
+
+    @staticmethod
+    def model_made_by_us(path: str) -> bool:
+        """
+        Мы ли сделали этот STEP.
+
+        Модель, выбранную руками, трогать нельзя ни при каких условиях --
+        это чужой файл, и «оптимизировать» его мы не вправе. Отличаем по
+        заголовку: свой STEP подписан GostLib в FILE_NAME.
+        """
+        try:
+            head = open(path, "rb").read(1024)
+        except OSError:
+            return False
+        return b"'GostLib','GostLib'" in head
+
+    def model_colors(self) -> Dict[str, str]:
+        """Путь STEP -> выбранный цвет, по всей библиотеке."""
+        out: Dict[str, str] = {}
+        for uid in self.db.all_uids():
+            c = self.db.get(uid)
+            if not c:
+                continue
+            for fp in (c.footprints or []):
+                m = getattr(fp, "model", None)
+                if m and m.path and getattr(m, "color", ""):
+                    out[os.path.normcase(os.path.abspath(m.path))] = m.color
+        return out
+
+    def apply_model_color(self, model) -> str:
+        """
+        Записать цвет в сам файл STEP, чтобы он был виден в Altium.
+
+        Раньше цвет жил только во встроенном просмотре: в Altium любая
+        перегнанная модель выходила белой, потому что в фасетном STEP не
+        было ни одной записи о цвете. Теперь цвет пишется в файл -- но
+        только в НАШ файл: у выбранного руками STEP нашей метки в
+        заголовке нет, и он остаётся нетронутым, как и договаривались.
+
+        Возвращает короткое пояснение для лога (пустая строка -- если
+        ничего делать не потребовалось).
+        """
+        from .mesh2step import set_step_color, step_has_color
+        path = getattr(model, "path", "") or ""
+        if not path or not os.path.isfile(path):
+            return ""
+        if not self.model_made_by_us(path):
+            return ("модель выбрана вручную — файл не трогаю, "
+                    "цвет останется таким, как в самом STEP")
+        if not step_has_color(path):
+            obj_path = os.path.splitext(path)[0] + ".obj"
+            if not os.path.isfile(obj_path):
+                return ("модель сделана старой версией — цвет появится "
+                        "после «Пережать 3D-модели»")
+            from .mesh2step import obj_to_step
+            obj_to_step(obj_path, path,
+                        name=os.path.splitext(os.path.basename(path))[0],
+                        budget=int(getattr(self.cfg, "model_faces", 0) or 0),
+                        color=getattr(model, "color", ""))
+            return "цвет записан в модель (файл перегенерирован)"
+        if set_step_color(path, getattr(model, "color", "")):
+            return ("цвет записан в модель" if getattr(model, "color", "")
+                    else "вернул родные цвета модели")
+        return ""
+
+    def model_z_range(self, path: str):
+        """Диапазон Z модели, с кешем по пути и времени файла."""
+        try:
+            key = f"{path}|{os.path.getmtime(path)}|{os.path.getsize(path)}"
+        except OSError:
+            return None
+        if key in self._ZCACHE:
+            return self._ZCACHE[key]
+        from .step3d import z_range
+        try:
+            val = z_range(path)
+        except Exception:
+            val = None
+        self._ZCACHE[key] = val
+        return val
+
+    def seat_model(self, fp: Footprint, force: bool = False) -> float:
+        """
+        Посадить 3D-тело на плоскость платы.
+
+        Altium считает Z = 0 плоскостью платы. Модели из EasyEDA приходят
+        с началом координат где придётся: у FBGA-96 геометрия шла от
+        -0.37 до +0.73 мм -- шарики уходили внутрь платы на треть
+        миллиметра. Правим НЕ файл, а standoff: файл может быть выбран
+        руками и вообще чужой, портить его нельзя.
+
+        У выводных корпусов ножки ниже платы -- это правильно, поэтому там
+        посадка не применяется. Возвращает выставленное смещение, мм.
+        """
+        m = getattr(fp, "model", None)
+        if not m or not m.path or not os.path.isfile(m.path):
+            return 0.0
+        if not force and abs(float(m.dz or 0.0)) > 1e-9:
+            return float(m.dz)        # человек уже задал -- не трогаем
+        if not force and not getattr(self.cfg, "seat_models", True):
+            return 0.0
+        rng = self.model_z_range(m.path)
+        if not rng:
+            return 0.0
+        zmin, zmax = rng
+        tht = any(float(getattr(p, "hole", 0) or 0) > 0 for p in fp.pads)
+        if tht:
+            if zmin < -0.05:
+                self.log(f"  3D {fp.name}: модель уходит на {-zmin:.2f} мм "
+                         f"ниже платы — для выводного корпуса это норма, "
+                         f"смещение не ставлю")
+            return 0.0
+        if abs(zmin) < 0.005:
+            return 0.0                # уже стоит на плате
+        m.dz = round(-zmin, 3)
+        self.log(f"  3D {fp.name}: посажена на плату, смещение "
+                 f"{m.dz:+.3f} мм (модель была {zmin:.2f}…{zmax:.2f} мм)")
+        return m.dz
+
+    def reseat_models(self, uids: Optional[Iterable[str]] = None,
+                      force: bool = True) -> Dict[str, int]:
+        """
+        Пересчитать посадку 3D-тел у компонентов каталога.
+
+        Нужно для того, что уже импортировано: у этих компонентов
+        смещение никто не считал, и тела сидят внутри платы.
+        """
+        ids = list(uids) if uids is not None else self.db.all_uids()
+        moved = 0
+        skipped = 0
+        with self.undo.step("Посадить 3D-модели на плату"):
+            for uid in ids:
+                c = self.db.get(uid)
+                if not c:
+                    continue
+                changed = False
+                for fp in c.footprints:
+                    before = float(getattr(fp.model, "dz", 0.0) or 0.0) \
+                        if fp.model else 0.0
+                    dz = self.seat_model(fp, force=force)
+                    if abs(dz - before) > 1e-9:
+                        changed = True
+                if changed:
+                    self.undo.touch(uid)
+                    self.db.upsert(c)
+                    moved += 1
+                else:
+                    skipped += 1
+        self.log(f"Посадка 3D: поправлено компонентов {moved}, "
+                 f"без изменений {skipped}")
+        return {"moved": moved, "skipped": skipped}
+
     def _localize_models(self, c: Component):
         """Скопировать 3D-модели и вендорские .PcbLib в рабочую папку."""
         for fp in c.footprints:
@@ -186,6 +354,11 @@ class Service:
                         self.log(f"  3D не скопирована: {e}")
                 else:
                     fp.model.path = dst
+            # тело должно стоять НА плате, а не в ней
+            try:
+                self.seat_model(fp)
+            except Exception as e:
+                self.log(f"  посадка 3D не удалась: {e}")
             if fp.source_pcblib and os.path.isfile(fp.source_pcblib):
                 vend = os.path.join(self.cfg.lib_dir, "vendor")
                 os.makedirs(vend, exist_ok=True)
@@ -255,7 +428,7 @@ class Service:
         c = self.db.get(uid)
         if not c:
             return None
-        self.undo.touch(uid)
+        self._snap(uid, "Перечитать УГО из источника")
         ref = c.source_ref or ""
         if "::" not in ref:
             raise ValueError(f"{c.name}: неизвестно, откуда он импортирован")
@@ -363,9 +536,185 @@ class Service:
                 comps.append(c)
         return self._absorb(comps)
 
+    def attach_footprint(self, uid: str, fp_path: str = "",
+                         fp_ref: str = "", replace: bool = False
+                         ) -> Optional[Component]:
+        """
+        Дозагрузить посадочное место к уже имеющемуся компоненту.
+
+        Обычная история: символ и 3D пришли, а посадки в источнике не
+        оказалось (или подобралась не та). Раньше приходилось импортировать
+        компонент заново и терять всю ручную работу над УГО. Теперь
+        посадка добавляется отдельно, а символ, раскладка и параметры
+        остаются как были.
+
+        `replace` -- заменить текущую посадку, иначе добавить второй.
+        """
+        c = self.db.get(uid)
+        if not c:
+            return None
+        if not fp_path and fp_ref:
+            hit = self._resolve_fp(fp_ref)
+            if not hit:
+                raise FileNotFoundError(
+                    f"Посадка '{fp_ref}' не найдена. Если индекс KiCad "
+                    f"пуст, нажмите «Обновить индекс».")
+            fp_path = hit[1]
+        if not fp_path or not os.path.isfile(fp_path):
+            raise FileNotFoundError(f"Файл посадки не найден: {fp_path}")
+        self._snap(uid, "Дозагрузить посадку")
+        ext = os.path.splitext(fp_path)[1].lower()
+        if ext != ".kicad_mod":
+            raise ValueError("Дозагрузить можно посадку KiCad (.kicad_mod). "
+                             "Вендорская .PcbLib подключается отдельно.")
+        fp = kc.parse_kicad_mod(fp_path)
+        if fp.model and fp.model.path:
+            r = kc.resolve_3d(fp.model.path)
+            fp.model.path = r or ""
+            if not r:
+                self.log("  3D-модель не найдена (в KiCad обычно .wrl, "
+                         "Altium понимает только .step)")
+        # Настройки корпуса -- зазоры, паста, высота -- принадлежат
+        # компоненту, а не файлу: при замене посадки их незачем терять.
+        old = c.footprints[0] if c.footprints else None
+        if old is not None:
+            fp.paste = getattr(old, "paste", True)
+            fp.paste_grid = getattr(old, "paste_grid", 0)
+            fp.paste_grid_over = getattr(old, "paste_grid_over", 1.0)
+            fp.paste_grid_fill = getattr(old, "paste_grid_fill", 60.0)
+            if fp.mask_expansion is None:
+                fp.mask_expansion = getattr(old, "mask_expansion", None)
+            if fp.paste_expansion is None:
+                fp.paste_expansion = getattr(old, "paste_expansion", None)
+            # 3D: если у новой посадки модели нет, а у старой была --
+            # переносим вместе с положением и цветом
+            if (not fp.model or not fp.model.path) and getattr(old, "model", None):
+                fp.model = old.model
+            if not fp.height:
+                fp.height = old.height
+        if replace and c.footprints:
+            c.footprints[0] = fp
+        else:
+            c.footprints.append(fp)
+        try:
+            self.seat_model(fp)
+        except Exception as e:                              # noqa: BLE001
+            self.log(f"  посадка 3D не удалась: {e}")
+        c.params["KiCadFootprint"] = fp.name
+        self.db.upsert(c)
+        self.log(f"{c.name}: посадка {fp.name} "
+                 f"{'заменена' if replace else 'добавлена'} "
+                 f"({len(fp.pads)} площадок)")
+        return c
+
+    def missing_footprint(self) -> List[Component]:
+        """Компоненты, у которых посадки нет вовсе -- их и надо дозагрузить."""
+        out = []
+        for uid in self.db.all_uids(only_lib=True):
+            c = self.db.get(uid)
+            if not c:
+                continue
+            has = any((f.pads or f.prims or f.is_external())
+                      for f in (c.footprints or []))
+            if not has:
+                out.append(c)
+        return out
+
+    # -------------------------------------------- текстовая копия для git --
+    def git_root(self) -> str:
+        """Папка текстового зеркала библиотеки (из настроек либо своя)."""
+        p = str(getattr(self.cfg, "git_dir", "") or "").strip()
+        return p or os.path.join(self.cfg.root, "library-git")
+
+    def git_export(self, root: str = "", with_models: bool = False
+                   ) -> Dict[str, object]:
+        """Выложить библиотеку в папку текстовых файлов (её и коммитить)."""
+        from . import gitlib
+        root = root or self.git_root()
+        comps = self.collect(self.db.all_uids(only_lib=True))
+        self.log(f"Выкладываю библиотеку в {root} ...")
+        return gitlib.export_tree(comps, root, with_models=with_models,
+                                  log=self.log)
+
+    def git_status(self, root: str = "") -> Dict[str, object]:
+        """Чем папка отличается от того, что сейчас в каталоге."""
+        from . import gitlib
+        root = root or self.git_root()
+        local = self.collect(self.db.all_uids(only_lib=True))
+        remote = gitlib.read_tree(root)
+        d = gitlib.diff(local, remote)
+        d["root"] = root
+        d["remote_total"] = len(remote)
+        d["local_total"] = len(local)
+        return d
+
+    def git_import(self, root: str = "", overwrite: bool = False
+                   ) -> Dict[str, object]:
+        """
+        Забрать компоненты из папки в каталог.
+
+        `overwrite` -- принимать и те, что уже есть (то есть «версия из
+        репозитория главнее»). Без него добавляются только новые: так
+        безопаснее, когда локально уже что-то правили.
+        """
+        from . import gitlib
+        root = root or self.git_root()
+        remote = gitlib.read_tree(root)
+        if not remote:
+            raise FileNotFoundError(
+                f"В {root} нет папки {gitlib.COMPONENTS} с компонентами")
+        added, updated, skipped = [], [], []
+        for c in remote:
+            cur = self.db.get(c.uid)
+            if cur is None:
+                self.db.upsert(c)
+                self.db.set_in_library([c.uid], True)
+                added.append(c.name)
+            elif overwrite:
+                self._snap(c.uid, "Версия из репозитория")
+                self.db.upsert(c)
+                self.db.set_in_library([c.uid], True)
+                updated.append(c.name)
+            else:
+                skipped.append(c.name)
+        self.log(f"Из {root}: добавлено {len(added)}, обновлено "
+                 f"{len(updated)}, пропущено {len(skipped)}")
+        return {"added": added, "updated": updated, "skipped": skipped,
+                "root": root}
+
+    def git_sync(self, root: str = "", with_models: bool = False
+                 ) -> Dict[str, object]:
+        """
+        Синхронизация в обе стороны за один раз.
+
+        Сначала забираем из папки то, чего у нас нет (кто-то добавил
+        компонент и запушил), потом выкладываем всё своё. Расхождения по
+        одному и тому же uid НЕ разрешаем молча: их список возвращается,
+        и человек решает сам -- это ровно тот случай, когда автоматика
+        затирает чужую работу.
+        """
+        root = root or self.git_root()
+        st = self.git_status(root)
+        pulled = self.git_import(root, overwrite=False) \
+            if st["theirs"] else {"added": [], "updated": [], "skipped": []}
+        pushed = self.git_export(root, with_models=with_models)
+        out = {"root": root, "pulled": pulled["added"],
+               "conflicts": [n for _u, n in st["diff"]],
+               "pushed": len(pushed["changed"])}
+        if out["conflicts"]:
+            self.log(f"  расходятся с репозиторием: "
+                     f"{len(out['conflicts'])} — "
+                     f"{', '.join(out['conflicts'][:5])}"
+                     + (" …" if len(out["conflicts"]) > 5 else ""))
+            self.log("  выложена НАША версия; чужую можно забрать кнопкой "
+                     "«Взять версию из репозитория»")
+        return out
+
     def import_lcsc(self, code: str) -> List[Component]:
         self.log(f"Запрашиваю {code} в EasyEDA ...")
-        c = easyeda.fetch(code, out_dir=self.cfg.models_dir, log=self.log)
+        c = easyeda.fetch(code, out_dir=self.cfg.models_dir, log=self.log,
+                          cache_dir=self.cfg.cache_dir,
+                          budget=int(getattr(self.cfg, "model_faces", 0) or 0))
         return self._absorb([c])
 
     # ------------------------------------------------------------ выгрузка --
@@ -577,6 +926,7 @@ class Service:
         n_fp = 0
         n_3d = 0
         missing_3d: List[str] = []
+        heavy_3d: List[Tuple[str, float]] = []
         seen = set()
         for c in lib_comps:
             for fp in c.footprints:
@@ -591,6 +941,23 @@ class Service:
                 if fp.model and fp.model.path:
                     if os.path.isfile(fp.model.path):
                         n_3d += 1
+                        # Цвет мог быть выбран, когда файла ещё не было
+                        # (или модель пережимали) -- сверяем перед сборкой,
+                        # иначе корпус приедет в Altium белым.
+                        if getattr(fp.model, "color", ""):
+                            try:
+                                self.apply_model_color(fp.model)
+                            except Exception:       # noqa: BLE001
+                                pass
+                        # Крупная модель -- это МИНУТЫ в Altium, а не
+                        # мегабайты на диске: разбор фасетного STEP самая
+                        # дорогая операция во всей сборке.
+                        try:
+                            mb = os.path.getsize(fp.model.path) / 1024 ** 2
+                        except OSError:
+                            mb = 0.0
+                        if mb >= 4.0:
+                            heavy_3d.append((fp.name, mb))
                     else:
                         missing_3d.append(fp.name)
 
@@ -604,12 +971,18 @@ class Service:
         ts = time.strftime("%Y%m%d_%H%M%S")
         job_path = os.path.join(self.cfg.jobs_dir, f"build_{ts}.txt")
         log_path = job_path + ".log"
+        job_notes: List[str] = []
         altiumjob.write_job(job_path, lib_comps, schlib, pcblib,
                             st=self.style(), log_path=log_path,
                             install=install, vendor_libs=vendor, fresh=fresh,
                             intlib=bool(libpkg), libpkg=libpkg,
+                            notes=job_notes,
                             pin_hot_end=getattr(self.cfg, "pin_location_hot",
                                                 False))
+        for n in job_notes[:20]:
+            self.log(f"  {n}")
+        if len(job_notes) > 20:
+            self.log(f"  ... и ещё {len(job_notes) - 20} таких же")
         altiumjob.write_pointer(self.cfg.root, job_path)
         # старый отчёт убираем: иначе после неудачной сборки утилита
         # покажет прошлый успешный и «не обновилось» снова пройдёт мимо
@@ -638,6 +1011,14 @@ class Service:
                  f"3D-моделей {n_3d}")
         for nm in missing_3d:
             self.log(f"  3D-модель не найдена на диске, посадка {nm}")
+        if heavy_3d:
+            heavy_3d.sort(key=lambda kv: -kv[1])
+            self.log("  ВНИМАНИЕ: крупные 3D-модели — Altium будет "
+                     "разбирать их долго:")
+            for nm, mb in heavy_3d[:5]:
+                self.log(f"    {nm}: {mb:.1f} МБ")
+            self.log("    «Запасные пути → Пережать 3D-модели» ускорит "
+                     "сборку в разы")
         if vendor:
             self.log(f"  вендорских библиотек посадок: {len(vendor)}")
 
@@ -648,6 +1029,7 @@ class Service:
                 "schlib": schlib, "pcblib": pcblib, "libpkg": libpkg,
                 "components": str(len(lib_comps)), "footprints": str(n_fp),
                 "models": str(n_3d), "vendor": ";".join(vendor),
+                "heavy3d": ";".join(f"{n}:{mb:.1f}" for n, mb in heavy_3d),
                 "problems": "\n".join(job_problems),
                 "hint": ("В Altium нажмите кнопку GostLib на панели "
                          "(или DXP → Run Script → GostLibBuilder → "
@@ -831,12 +1213,92 @@ class Service:
             "models": models,
             "mesh_cache": self._dir_size(mesh),
             "jobs": self._dir_size(self.cfg.jobs_dir),
+            "cache": self._dir_size(self.cfg.cache_dir),
             "backups": self._dir_size(self.backup_dir()),
             "catalog": self._files_size([self.cfg.db_path]),
+            # ссылки на удалённые компоненты: места не занимают, но
+            # показать их стоит -- по ним видно, что чистка не помешает
+            "orphans": self.db.orphan_items(),
         }
         out["total"] = (common + sum(projects.values()) + models
                         + out["mesh_cache"] + out["jobs"] + out["backups"]
-                        + out["catalog"])
+                        + out["catalog"] + out["cache"])
+        return out
+
+    def shrink_models(self, budget: int = 0, over_mb: float = 4.0,
+                      progress=None) -> Dict[str, object]:
+        """
+        Пережать уже скачанные 3D-модели под текущий бюджет треугольников.
+
+        Нужно затем, что старые модели остались крупными, а именно они и
+        делают сборку многоминутной: замер на живом проекте -- посадка с
+        моделью на 23 МБ строилась 337 секунд, соседняя без модели -- 8,5.
+        Пережимаем из исходного OBJ, если он рядом; сам OBJ не трогаем,
+        поэтому операция обратима -- поднял бюджет, пережал заново.
+        """
+        from .mesh2step import obj_to_step
+
+        budget = int(budget or getattr(self.cfg, "model_faces", 0) or 0)
+        d = self.cfg.models_dir
+        done: List[str] = []
+        skipped: List[str] = []
+        before = after = 0
+        names = sorted(os.listdir(d)) if os.path.isdir(d) else []
+        steps = [n for n in names if n.lower().endswith(".step")]
+        # Перегонка заново стёрла бы выбранный цвет -- забираем его заранее.
+        colors = self.model_colors()
+        for i, n in enumerate(steps):
+            step_path = os.path.join(d, n)
+            try:
+                size = os.path.getsize(step_path)
+            except OSError:
+                continue
+            if size < over_mb * 1024 ** 2:
+                continue
+            if not self.model_made_by_us(step_path):
+                skipped.append(f"{n}: выбрана вручную — не трогаю")
+                continue
+            obj_path = os.path.splitext(step_path)[0] + ".obj"
+            if not os.path.isfile(obj_path):
+                skipped.append(f"{n}: нет исходного .obj рядом")
+                continue
+            if progress:
+                progress(i, len(steps), n)
+            try:
+                obj_to_step(obj_path, step_path,
+                            name=os.path.splitext(n)[0],
+                            log=self.log, budget=budget,
+                            color=colors.get(
+                                os.path.normcase(os.path.abspath(step_path)),
+                                ""))
+            except Exception as e:
+                skipped.append(f"{n}: {e}")
+                continue
+            before += size
+            after += os.path.getsize(step_path)
+            done.append(n)
+            self.log(f"  пережата: {n} "
+                     f"{size / 1024 ** 2:.1f} -> "
+                     f"{os.path.getsize(step_path) / 1024 ** 2:.1f} МБ")
+        return {"done": done, "skipped": skipped,
+                "before": before, "after": after, "budget": budget}
+
+    def heavy_models(self, over_mb: float = 4.0) -> List[Tuple[str, int]]:
+        """Модели, которые заметно замедлят сборку. (имя, байт), крупные первыми."""
+        d = self.cfg.models_dir
+        out: List[Tuple[str, int]] = []
+        if not os.path.isdir(d):
+            return out
+        for n in os.listdir(d):
+            if not n.lower().endswith(".step"):
+                continue
+            try:
+                size = os.path.getsize(os.path.join(d, n))
+            except OSError:
+                continue
+            if size >= over_mb * 1024 ** 2:
+                out.append((n, size))
+        out.sort(key=lambda kv: -kv[1])
         return out
 
     def clean_temp(self, keep_jobs: int = 5) -> int:
@@ -845,6 +1307,10 @@ class Service:
         Возвращает освобождённые байты. Библиотеки и модели не трогает.
         """
         freed = 0
+        # Скачанное из сети восстанавливается само -- значит, чистится.
+        if os.path.isdir(self.cfg.cache_dir):
+            freed += self._dir_size(self.cfg.cache_dir)
+            shutil.rmtree(self.cfg.cache_dir, ignore_errors=True)
         mesh = os.path.join(self.cfg.models_dir, "_mesh_cache")
         if os.path.isdir(mesh):
             freed += self._dir_size(mesh)
@@ -862,6 +1328,12 @@ class Service:
                 os.remove(full)
             except OSError:
                 pass
+        # Ссылки проектов на удалённые компоненты держатся, пока их можно
+        # вернуть Ctrl+Z. Явная чистка -- как раз тот момент, когда с ними
+        # прощаются: иначе они висят вечно.
+        n = self.db.purge_orphans()
+        if n:
+            self.log(f"Убрано ссылок на удалённые компоненты: {n}")
         self.log(f"Освобождено: {freed / 1024 ** 2:.1f} МБ")
         return freed
 
@@ -984,7 +1456,7 @@ class Service:
         c, fp = self._fp_of(uid, fp_index)
         if not c or fp is None:
             raise ValueError("Компонент или посадочное место не найдено")
-        self.undo.touch(uid)
+        self._snap(uid, "3D-модель")
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
         ext = os.path.splitext(path)[1].lower()
@@ -996,21 +1468,122 @@ class Service:
                 shutil.copy2(path, dst)
         elif ext in (".obj", ".wrl", ".stl"):
             from .mesh2step import obj_to_step
+            # Исходная сетка нужна встроенному быстрому просмотру. STEP,
+            # полученный из OBJ, гораздо тяжелее разбирать обратно.
+            preview = os.path.join(self.cfg.models_dir,
+                                   base + ext)
+            if os.path.abspath(path) != os.path.abspath(preview):
+                shutil.copy2(path, preview)
             dst = os.path.join(self.cfg.models_dir, base + ".step")
             self.log(f"Конвертирую {os.path.basename(path)} -> STEP ...")
-            obj_to_step(path, dst, name=base, log=self.log)
+            obj_to_step(preview, dst, name=base, log=self.log,
+                        budget=int(getattr(self.cfg, "model_faces", 0) or 0),
+                        color=(getattr(fp.model, "color", "")
+                               if fp.model else ""))
         else:
             raise ValueError(f"Не знаю такой формат модели: {ext}. "
                              f"Нужен .step/.stp, либо .obj/.stl для конвертации.")
-        fp.model = Model3D(path=dst, dx=dx, dy=dy, dz=dz, rx=rx, ry=ry, rz=rz)
+        # Цвет -- свойство просмотра, а не файла: при замене модели его
+        # незачем терять. Раньше выбор другого STEP молча сбрасывал
+        # подобранный цвет корпуса.
+        old_color = getattr(fp.model, "color", "") if fp.model else ""
+        fp.model = Model3D(path=dst, dx=dx, dy=dy, dz=dz, rx=rx, ry=ry, rz=rz,
+                           color=old_color)
+        # Цвет мог быть выбран до замены модели -- переносим его и в файл.
+        if old_color:
+            try:
+                self.apply_model_color(fp.model)
+            except Exception:                       # noqa: BLE001
+                pass
+        # Геометрию файла не трогаем -- ни свою, ни тем более выбранную
+        # руками. Если тело стоит не на плоскости платы, правим ТОЛЬКО
+        # standoff.
+        try:
+            self.seat_model(fp)
+        except Exception as e:
+            self.log(f"  посадка 3D не удалась: {e}")
         self.db.upsert(c)
         self.log(f"{c.name}: 3D-модель -> {os.path.basename(dst)}")
+        return c
+
+    def set_expansion(self, uid: str, mask, paste, fp_index: int = 0
+                      ) -> Optional[Component]:
+        """
+        Зазоры маски и пасты у посадочного места. None -- «не задавать».
+
+        Именно у посадочного места: зазор -- свойство корпуса, у BGA он
+        один, у QFN с тепловым пятном другой. Общая настройка на всю
+        библиотеку смысла не имеет и молча перебивала бы правила платы.
+        """
+        c, fp = self._fp_of(uid, fp_index)
+        if not c or fp is None:
+            return None
+        self._snap(uid, "Зазоры площадок")
+        fp.mask_expansion = None if mask is None else float(mask)
+        fp.paste_expansion = None if paste is None else float(paste)
+        self.db.upsert(c)
+        def _s(v):
+            return "правило проекта" if v is None else f"{v:g} мм"
+        self.log(f"{c.name}/{fp.name}: зазор маски {_s(fp.mask_expansion)}, "
+                 f"пасты {_s(fp.paste_expansion)}")
+        if fp.mask_expansion is not None or fp.paste_expansion is not None:
+            self.log("  применится при следующей сборке: в свойствах "
+                     "площадки станет «Manual» вместо «Rule Expansion»")
+        return c
+
+    def set_paste(self, uid: str, on: bool) -> Optional[Component]:
+        """
+        Наносить ли пасту под этот компонент. Флаг общий на компонент:
+        трафарет режут на всю деталь, а не на отдельное посадочное место.
+
+        Выключено -- в задании у каждой площадки появится отрицательный
+        зазор пасты по её же размеру, и окна в трафарете не будет. Так
+        делают у прессуемых разъёмов, тестовых пятаков и экранов.
+        """
+        c = self.db.get(uid)
+        if not c:
+            return None
+        self._snap(uid, "Паста")
+        for fp in (c.footprints or []):
+            fp.paste = bool(on)
+        self.db.upsert(c)
+        self.log(f"{c.name}: паста {'наносится' if on else 'НЕ наносится'}")
+        return c
+
+    def set_paste_grid(self, uid: str, n: int, over: float = 1.0,
+                       fill: float = 60.0, fp_index: int = 0
+                       ) -> Optional[Component]:
+        """
+        Сетка окон пасты у крупных площадок этой посадки.
+
+        n = 0 -- сплошное окно, как у площадки. Иначе окно разбивается
+        на n x n квадратиков, накрывающих `fill` процентов площади, и
+        только у площадок крупнее `over` миллиметров: мелочь трогать
+        незачем, а тепловому пятаку сплошное окно вредит.
+        """
+        c, fp = self._fp_of(uid, fp_index)
+        if not c or fp is None:
+            return None
+        self._snap(uid, "Сетка пасты")
+        fp.paste_grid = max(0, int(n))
+        fp.paste_grid_over = max(0.2, float(over))
+        fp.paste_grid_fill = max(10.0, min(100.0, float(fill)))
+        self.db.upsert(c)
+        if fp.paste_grid < 2:
+            self.log(f"{c.name}/{fp.name}: окно пасты сплошное")
+        else:
+            self.log(f"{c.name}/{fp.name}: сетка пасты "
+                     f"{fp.paste_grid}×{fp.paste_grid} у площадок от "
+                     f"{fp.paste_grid_over:g} мм, покрытие "
+                     f"{fp.paste_grid_fill:g}%")
         return c
 
     def clear_model(self, uid: str, fp_index: int = 0) -> Optional[Component]:
         c, fp = self._fp_of(uid, fp_index)
         if not c or fp is None:
             return None
+        # снимок ДО правки: без него Ctrl+Z нечего возвращать
+        self._snap(uid, "Отвязать 3D-модель")
         fp.model = None
         self.db.upsert(c)
         self.log(f"{c.name}: 3D-модель отвязана")
@@ -1021,10 +1594,38 @@ class Service:
         c, fp = self._fp_of(uid, fp_index)
         if not c or fp is None or not fp.model:
             return None
+        # снимок ДО правки: без него Ctrl+Z нечего возвращать
+        self._snap(uid, "Положение 3D-модели")
         for k in ("dx", "dy", "dz", "rx", "ry", "rz"):
             if k in kw and kw[k] is not None:
                 setattr(fp.model, k, float(kw[k]))
         self.db.upsert(c)
+        return c
+
+    def set_model_color(self, uid: str, color: str,
+                        fp_index: int = 0) -> Optional[Component]:
+        """Сохранить цвет корпуса во встроенном просмотре."""
+        c, fp = self._fp_of(uid, fp_index)
+        if not c or fp is None or not fp.model:
+            return None
+        # снимок ДО правки: без него Ctrl+Z нечего возвращать
+        self._snap(uid, "Цвет модели")
+        value = (color or "").strip().upper()
+        if value and (len(value) != 7 or value[0] != "#"):
+            raise ValueError("цвет должен быть в формате #RRGGBB")
+        if value:
+            try:
+                int(value[1:], 16)
+            except ValueError as exc:
+                raise ValueError("цвет должен быть в формате #RRGGBB") from exc
+        fp.model.color = value
+        self.db.upsert(c)
+        try:
+            note = self.apply_model_color(fp.model)
+        except Exception as e:                      # noqa: BLE001
+            note = f"в файл модели цвет записать не удалось: {e}"
+        self.log(f"{c.name}: цвет корпуса "
+                 f"{value or 'родной'}{'; ' + note if note else ''}")
         return c
 
     def set_tape_rotation(self, uid: str, angle: float, fp_index: int = 0
@@ -1033,6 +1634,8 @@ class Service:
         c, fp = self._fp_of(uid, fp_index)
         if not c or fp is None or not fp.model:
             return None
+        # снимок ДО правки: без него Ctrl+Z нечего возвращать
+        self._snap(uid, "Поворот в ленте")
         fp.model.tape_rot = float(angle) % 360.0
         self.db.upsert(c)
         self.log(f"{c.name}: угол в ленте {fp.model.tape_rot:g}°")
@@ -1043,6 +1646,8 @@ class Service:
         c, fp = self._fp_of(uid, fp_index)
         if not c or fp is None:
             return None
+        # снимок ДО правки: без него Ctrl+Z нечего возвращать
+        self._snap(uid, "Высота корпуса")
         fp.height = float(height)
         self.db.upsert(c)
         return c
@@ -1168,14 +1773,63 @@ class Service:
         return ""
 
     # ------------------------------------------------------------ прочее ----
+    PARAM_TYPES = {
+        "str": "текст",
+        "num": "число",
+        "url": "ссылка",
+        "date": "дата",
+    }
+
+    @staticmethod
+    def check_param(value: str, kind: str) -> str:
+        """
+        Проверить значение параметра по типу. Возвращает пояснение
+        ошибки или пустую строку.
+
+        Смысл проверки не в строгости, а в опечатках: «2,5» вместо «2.5»
+        и «htp://» вместо «http://» уезжают в перечень элементов молча, а
+        всплывают уже у закупки.
+        """
+        v = str(value or "").strip()
+        if not v:
+            return ""
+        if kind == "num":
+            try:
+                float(v.replace(",", ".").replace(" ", ""))
+            except ValueError:
+                return f"«{v}» -- не число"
+        elif kind == "url":
+            low = v.lower()
+            if not (low.startswith(("http://", "https://", "file:///"))
+                    or os.path.isabs(v)):
+                return f"«{v}» -- не ссылка и не путь к файлу"
+        elif kind == "date":
+            import datetime as _dt
+            for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%Y"):
+                try:
+                    _dt.datetime.strptime(v, fmt)
+                    return ""
+                except ValueError:
+                    continue
+            return f"«{v}» -- не дата (нужно ГГГГ-ММ-ДД или ДД.ММ.ГГГГ)"
+        return ""
+
     def apply_params(self, uid: str, params: Dict[str, str],
                      ctype: str = "", designator: str = "",
                      name: str = "", rebuild: bool = True,
-                     designator_manual: bool = True) -> Optional[Component]:
+                     designator_manual: bool = True,
+                     meta: Optional[Dict[str, Dict]] = None
+                     ) -> Optional[Component]:
         c = self.db.get(uid)
         if not c:
             return None
+        # снимок ДО правки: без него Ctrl+Z нечего возвращать
+        self._snap(uid, "Правка параметров")
         c.params = dict(params)
+        if meta is not None:
+            # описание держим только для тех параметров, что есть
+            c.param_meta = {k: dict(v) for k, v in meta.items()
+                            if k in c.params}
         if ctype:
             c.ctype = ctype
         if designator:
@@ -1229,6 +1883,10 @@ class Service:
                  fix_designator: bool = True) -> int:
         """Назначить тип вручную и перерисовать символ."""
         n = 0
+        uids = list(uids)
+        # Один шаг на всю пачку: человек назначил тип двадцати строкам --
+        # и отменять он будет тоже одним нажатием, а не двадцатью.
+        self.undo.begin(f"Смена типа: {len(uids)}")
         for u in uids:
             c = self.db.get(u)
             if not c or c.ctype == ctype:
@@ -1242,6 +1900,7 @@ class Service:
             self.db.upsert(c)
             n += 1
             self.log(f"{c.name}: тип -> {classify.CTYPE_NAME.get(ctype, ctype)}")
+        self.undo.end()
         return n
 
     def apply_layout(self, uid: str, sym) -> Optional[Component]:
@@ -1249,7 +1908,7 @@ class Service:
         c = self.db.get(uid)
         if not c:
             return None
-        self.undo.touch(uid)
+        self._snap(uid, "Правка УГО")
         c.symbol = sym
         c.symbol.manual_layout = True
         symbolgen.build(c, self.style())
@@ -1262,12 +1921,13 @@ class Service:
         c = self.db.get(uid)
         if not c:
             return None
-        self.undo.touch(uid)
+        self._snap(uid, "Автоматическая раскладка")
         c.symbol.manual_layout = False
         c.symbol.dividers = []
         c.symbol.body_w = c.symbol.body_h = 0
         c.symbol.field_l = c.symbol.field_r = 0
         c.symbol.user_lines = []
+        c.symbol.user_shapes = []    # дуги, окружности, полигоны
         c.symbol.parts = {}          # и геометрия секций тоже
         for lst in (c.raw_pins, c.symbol.pins,
                     getattr(c, "native_pins", None) or []):
@@ -1291,7 +1951,7 @@ class Service:
         c = self.db.get(uid)
         if not c:
             return None
-        self.undo.touch(uid)
+        self._snap(uid, "Переименование")
         name = (name or "").strip()
         if not name:
             raise ValueError("Имя не может быть пустым")
@@ -1332,12 +1992,19 @@ class Service:
         name = "_".join(p for p in parts if p)
         return _safe_name(name) or c.name
 
-    def apply_pins(self, uid: str, pins: List[dict]) -> Optional[Component]:
+    def apply_pins(self, uid: str, pins: List[dict],
+                   reset_geometry: bool = False) -> Optional[Component]:
         """pins: [{'number','name','etype','unit','side','group'}] -- ручная раскладка."""
         c = self.db.get(uid)
         if not c:
             return None
-        self.undo.touch(uid)
+        self._snap(uid, "Раскладка выводов")
+        if reset_geometry:
+            # План от ИИ задаёт логическую компоновку (секция/сторона/группа),
+            # а не координаты старого холста. Иначе ранее вручную сдвинутые
+            # выводы останутся на прежних местах и новый план будет незаметен.
+            c.symbol.manual_layout = False
+            c.symbol.parts = {}
         by_num = {p.number: p for p in c.raw_pins}
         # Порядок строк в таблице = порядок выводов сверху вниз. Для
         # разъёмов это единственный вменяемый способ: там ни имена, ни

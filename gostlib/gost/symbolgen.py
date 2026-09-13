@@ -40,6 +40,48 @@ def _poly(pts, w=1, filled=False, unit=1) -> SymPrim:
                    filled=filled, unit=unit)
 
 
+def shape_prims(shapes, lw: int = 1, unit: int = 1) -> List[SymPrim]:
+    """
+    Фигуры из редактора символа -> примитивы.
+
+    Общая точка для обеих веток генератора (односекционной и
+    посекционной) и для превью: иначе дуга, нарисованная в редакторе,
+    жила бы только на холсте, а в Altium не доезжала.
+    """
+    out: List[SymPrim] = []
+    for sh in (shapes or []):
+        if not isinstance(sh, dict):
+            continue
+        kind = str(sh.get("kind") or "")
+        pts = [[float(p[0]), float(p[1])] for p in (sh.get("pts") or [])
+               if len(p) >= 2]
+        w = int(sh.get("w", lw) or lw)
+        col = int(sh.get("col", -1))
+        fill = bool(sh.get("fill"))
+        pr: Optional[SymPrim] = None
+        if kind == "circle" and pts:
+            pr = _ellipse(pts[0][0], pts[0][1], float(sh.get("r", 0) or 0),
+                          w, fill, unit=unit)
+        elif kind == "arc" and pts:
+            pr = _arc(pts[0][0], pts[0][1], float(sh.get("r", 0) or 0),
+                      float(sh.get("a1", 0.0)), float(sh.get("a2", 360.0)),
+                      w, unit=unit)
+        elif kind == "rect" and len(pts) >= 2:
+            pr = _rect(pts[0][0], pts[0][1], pts[1][0], pts[1][1], w,
+                       fill, unit=unit)
+        elif kind == "poly" and len(pts) >= 2:
+            p2 = list(pts)
+            if sh.get("close") and len(p2) > 2:
+                p2.append(list(p2[0]))
+            pr = _poly(p2, w, fill, unit=unit)
+        if pr is None:
+            continue
+        if col != -1:
+            pr.color = col
+        out.append(pr)
+    return out
+
+
 def _arc(cx, cy, r, a1, a2, w=1, unit=1) -> SymPrim:
     return SymPrim(kind="arc", pts=[[cx, cy]], radius=r, a1=a1, a2=a2,
                    width=w, unit=unit)
@@ -256,9 +298,16 @@ def build_box(comp: Component, st: Style, unit: int = 1,
                  + 2 * st.text_pad)
     lw = max(lw, st.min_side_field if left else 0)
     rw = max(rw, st.min_side_field if right else 0)
+    if st.compact_symbols and left and right:
+        # Поля остаются одинаковыми, но их ширина выше уже рассчитана по
+        # реальной узкой метрике Altium (0.32 em, а не прежние 0.48 em).
+        # Поэтому партномер находится строго по центру без прежнего
+        # полуторакратного раздувания обеих сторон.
+        lw = rw = max(lw, rw)
     label = label or classify.label_for(comp)
+    label_pad = GRID if st.compact_symbols else 2 * st.text_pad
     mw = max(st.min_main_field,
-             snap_up(st.text_w(label, st.size_type) + 2 * st.text_pad))
+             snap_up(st.text_w(label, st.size_type) + label_pad))
     if not st.ic_fields:
         lw = lw or st.min_side_field
         rw = rw or st.min_side_field
@@ -876,6 +925,7 @@ def build_manual(comp: Component, st: Style) -> Symbol:
             if len(ln) > 5:
                 pr.color = int(ln[5])
             prims.append(pr)
+    prims += shape_prims(getattr(sym, "user_shapes", None), st.lw_inner)
 
     if native:
         prims = [SymPrim(**{k: v for k, v in pr.__dict__.items()
@@ -978,6 +1028,7 @@ def _manual_part(comp: Component, st: Style, pins: List[SymPin],
             if len(ln) > 5:
                 pr.color = int(ln[5])
             prims.append(pr)
+    prims += shape_prims(g.get("user_shapes"), st.lw_inner, unit=part)
 
     # Два вывода в одной точке Altium показывает как один. Считаем это
     # отдельно по каждой секции: у разных секций координаты совпадают
@@ -1141,7 +1192,10 @@ def build_native(comp: Component, st: Style) -> Symbol:
     sym.prims = prims
     x0, y0, x1, y1 = sym.bbox()
     sym.body_w, sym.body_h = int(x1 - x0), int(y1 - y0)
-    sym.designator_pos = [int((x0 + x1) / 2), int(y1 + 100)]
+    # Позиционное обозначение ставим ОТ ЛЕВОГО КРАЯ, а не от середины:
+    # текст пишется слева направо, и от середины «R?» наезжало на корпус
+    # у любого узкого элемента -- у резистора он всего 80 mil шириной.
+    sym.designator_pos = [int(x0), int(y1 + 60)]
     sym.comment_pos = [int((x0 + x1) / 2), int(y0 - 100)]
     return sym
 
@@ -1239,19 +1293,25 @@ def verify(comp: Component, st: Style) -> List[str]:
     # наложение номеров и имён по вертикали на каждой стороне
     hn = st.text_h(st.size_pin_num)
     hname = st.text_h(st.size_pin)
-    for side in ("L", "R"):
-        ys = sorted(p.y for p in pins if p.side == side)
-        for a, b in zip(ys, ys[1:]):
-            d = abs(b - a)
-            if d < 1e-6:
-                problems.append(f"на стороне {side} два вывода в одной точке "
-                                f"y={a}")
-                break
-            if d < max(hn, hname) * 0.95:
-                problems.append(
-                    f"на стороне {side} шаг {int(d)} mil меньше высоты текста "
-                    f"({int(max(hn, hname))} mil) -- подписи наедут")
-                break
+    # Разные секции никогда не показываются одновременно. Сравнивать их
+    # координаты между собой нельзя: у каждой секции закономерно есть,
+    # например, первый левый вывод на одной и той же высоте.
+    units = sorted({int(p.unit or 1) for p in pins}) or [1]
+    for unit in units:
+        for side in ("L", "R"):
+            ys = sorted(p.y for p in pins
+                        if int(p.unit or 1) == unit and p.side == side)
+            for a, b in zip(ys, ys[1:]):
+                d = abs(b - a)
+                where = f"секции {unit}, сторона {side}"
+                if d < 1e-6:
+                    problems.append(f"в {where} два вывода в одной точке y={a}")
+                    break
+                if d < max(hn, hname) * 0.95:
+                    problems.append(
+                        f"в {where} шаг {int(d)} mil меньше высоты текста "
+                        f"({int(max(hn, hname))} mil) -- подписи наедут")
+                    break
 
     nums = {}
     for p in pins:

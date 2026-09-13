@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem,
                                QDoubleSpinBox, QProgressBar, QPushButton, QSpinBox,
+                               QSplitter,
                                QTabWidget, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
@@ -133,14 +134,57 @@ class KicadDialog(QDialog):
         v2 = QVBoxLayout(g2)
         v2.addWidget(self.fp_edit)
         v2.addWidget(self.fp_list)
-        lay.addWidget(g1)
-        lay.addWidget(g2)
+
+        # Предпросмотр прямо здесь. Раньше выбирать приходилось вслепую по
+        # имени: «QFN-56-1EP_7x7mm_P0.4mm_EP3.8x3.8mm» -- это шесть похожих
+        # посадок, и какая из них с нужным пятаком, видно только глазами.
+        from .widgets import PreviewPane, allow_narrow, fit_to_screen
+        from .view3d import Model3DPane
+        # Фон панели совпадает с фоном самой картинки: у посадки SVG
+        # тёмный, и на белой панели он выглядел чёрным квадратом посреди
+        # белого поля. Те же цвета, что и в главном окне.
+        self.prev_sym = PreviewPane("Символ", bg="#ffffff")
+        self.prev_fp = PreviewPane("Посадочное место", bg="#101018")
+        self.prev_3d = Model3DPane()
+        self.prev_3d.set_model(None, None, "3D-модели нет")
+        prev = QSplitter(Qt.Vertical)
+        top = QSplitter(Qt.Horizontal)
+        top.addWidget(self.prev_sym)
+        top.addWidget(self.prev_fp)
+        top.setSizes([420, 420])
+        prev.addWidget(top)
+        prev.addWidget(self.prev_3d)
+        prev.setSizes([420, 300])
+
+        lists = QWidget()
+        lv = QVBoxLayout(lists)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.addWidget(g1)
+        lv.addWidget(g2)
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(lists)
+        split.addWidget(prev)
+        # Списки не должны сплющиваться в полоску, но и половину окна им
+        # отдавать незачем: смотреть надо на превью.
+        split.setSizes([420, 780])
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        lay.addWidget(split, 1)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
-        self.resize(820, 660)
+        # Сначала снимаем накопленный минимум (иначе окно требует под две
+        # тысячи пикселей и Qt раздвигает его на соседний монитор), потом
+        # задаём размер по рабочей области ЭТОГО экрана.
+        allow_narrow(self, extra=(self.prev_sym, self.prev_fp, self.prev_3d))
+        for w in (self.sym_list, self.fp_list):
+            w.setMinimumWidth(220)
+        lists.setMinimumWidth(260)
+        fit_to_screen(self, 1240, 780)
+        self._prev_worker = None
+        self._prev_token = 0
 
         self._pick_sym = None
         self._pick_fp = None
@@ -222,6 +266,8 @@ class KicadDialog(QDialog):
     def _sym_picked(self):
         it = self.sym_list.currentItem()
         self._pick_sym = it.data(0, Qt.UserRole) if it else None
+        if self._pick_sym:
+            self._show_sym(self._pick_sym[0], self._pick_sym[1])
         # если у символа прописана посадка -- сразу подставим её в поиск
         if self._pick_sym and not self.fp_edit.text().strip():
             try:
@@ -235,6 +281,114 @@ class KicadDialog(QDialog):
     def _fp_picked(self):
         it = self.fp_list.currentItem()
         self._pick_fp = it.data(0, Qt.UserRole) if it else None
+        self._show_fp(self._pick_fp)
+
+    # -------------------------------------------------------- предпросмотр --
+    def _show_sym(self, path: str, name: str):
+        """Нарисовать выбранный символ, не заводя компонент в каталоге."""
+        if not path or not name:
+            self.prev_sym.set_svg("", "символ не выбран")
+            return
+        try:
+            from ..sources import kicad as kc
+            from ..render import svg
+            from ..gost import symbolgen
+            comp = kc.component_from_kicad_sym(path, name)
+            # Показываем ТО, ЧТО ПОЛУЧИТСЯ, а не сырой разбор файла. Без
+            # сборки в превью висели только выводы и надписи «R?»/«R»:
+            # графика источника лежит в native_prims, а корпус по ЕСКД
+            # рисует генератор, и до него дело просто не доходило.
+            n = len(comp.raw_pins or comp.symbol.pins)
+            try:
+                comp.symbol = symbolgen.build(comp, self.svc.style())
+            except Exception as e:                          # noqa: BLE001
+                self.prev_sym.set_svg(
+                    "", f"{name}: символ не собрался ({e})")
+                return
+            self.prev_sym.set_svg(
+                svg.symbol_svg(comp),
+                f"{name} — выводов {n}, "
+                f"секций {max(1, int(comp.symbol.part_count or 1))}")
+        except Exception as e:                              # noqa: BLE001
+            self.prev_sym.set_svg("", f"символ не разобрался: {e}")
+
+    def _show_fp(self, path: str):
+        """
+        Посадка и её 3D-модель.
+
+        Посадку рисуем сразу -- разбор .kicad_mod мгновенный. Модель
+        грузим в фоне: STEP из библиотеки KiCad бывает на десятки
+        мегабайт, и в главном потоке окно на нём просто встанет.
+        """
+        self._prev_token += 1
+        if not path or not os.path.isfile(path):
+            self.prev_fp.set_svg("", "посадка не выбрана")
+            self.prev_3d.set_model(None, None, "3D-модели нет")
+            return
+        try:
+            from ..sources import kicad as kc
+            from ..render import svg
+            from .. import fpinfo
+            fp = kc.parse_kicad_mod(path)
+        except Exception as e:                              # noqa: BLE001
+            self.prev_fp.set_svg("", f"посадка не разобралась: {e}")
+            self.prev_3d.set_model(None, None, "3D-модели нет")
+            return
+        note = f"{fp.name} — площадок {len(fp.pads)}"
+        try:
+            d = fpinfo.describe(fp)
+            note += "   " + "; ".join(d.lines()[:2])
+        except Exception:                                   # noqa: BLE001
+            pass
+        self.prev_fp.set_svg(svg.footprint_svg(fp), note)
+
+        # Путь к модели в .kicad_mod записан переменной вида
+        # ${KICAD9_3DMODEL_DIR}/Resistor_SMD.3dshapes/R_0402.wrl, да ещё и
+        # на .wrl, которого Altium не понимает. Разворачиваем переменную и
+        # ищем .step рядом -- ровно как при настоящем импорте; без этого
+        # превью честно писало «файл модели не найден» на каждой посадке.
+        mpath = fp.model.path if (fp.model and fp.model.path) else ""
+        raw = mpath
+        if mpath and not os.path.isfile(mpath):
+            try:
+                mpath = kc.resolve_3d(mpath) or ""
+            except Exception:                               # noqa: BLE001
+                mpath = ""
+            if mpath and fp.model:
+                fp.model.path = mpath
+        if not mpath or not os.path.isfile(mpath):
+            base = os.path.basename(raw) if raw else ""
+            self.prev_3d.set_model(
+                None, fp,
+                "у посадки нет 3D-модели" if not raw else
+                f"{base}: рядом нет .step — Altium понимает только его, "
+                f"а KiCad кладёт .wrl")
+            return
+        size = os.path.getsize(mpath) / 1e6
+        self.prev_3d.set_model(None, fp,
+                               f"{os.path.basename(mpath)} — {size:.1f} МБ, "
+                               f"читаю…")
+        from .main_window import ModelWorker
+        w = ModelWorker(mpath, fp, os.path.dirname(mpath), self._prev_token)
+        w.done.connect(self._model_ready)
+        self._prev_worker = w
+        w.start()
+
+    def _model_ready(self, token, model, mesh, extra):
+        if token != self._prev_token:
+            return          # выбрали уже другую посадку, этот ответ не нужен
+        # Сетка и STEP рисуются по-разному: mesh отдаётся сцене отдельным
+        # вызовом, разобранный STEP -- обычной моделью. Так же, как в
+        # главном окне.
+        note = next((s for s in extra if s), "3D-модель")
+        if mesh is not None and getattr(mesh, "ok", False):
+            self.prev_3d.set_model(None, None, note)
+            self.prev_3d.scene.set_mesh(mesh)
+        elif model is not None and getattr(model, "ok", False):
+            self.prev_3d.set_model(model, None, note)
+        else:
+            self.prev_3d.set_model(None, None,
+                                   note or "модель не разобралась")
 
     def values(self) -> dict:
         sym_path, sym_name = self._pick_sym or ("", "")
@@ -260,7 +414,8 @@ class ProjectsDialog(QDialog):
         super().__init__(parent)
         self.svc = svc
         self.setWindowTitle("Проекты и их библиотеки")
-        self.resize(860, 480)
+        from .widgets import fit_to_screen
+        fit_to_screen(self, 860, 480)
 
         self.list = QTreeWidget()
         self.list.setColumnCount(4)
@@ -477,6 +632,13 @@ class SettingsDialog(QDialog):
         self.pow_marks.setChecked(cfg.show_power_marks)
         self.fields = QCheckBox("дополнительные поля у микросхем")
         self.fields.setChecked(cfg.ic_fields)
+        self.compact = QCheckBox(
+            "максимально компактная ширина УГО по сетке")
+        self.compact.setToolTip(
+            "Подгоняет поля под фактическую ширину шрифта Altium, "
+            "делает боковые стороны одинаковыми и оставляет вокруг "
+            "партномера по полклетки.")
+        self.compact.setChecked(getattr(cfg, "compact_symbols", True))
         self.pin_nums = QCheckBox("показывать номера выводов")
         self.pin_nums.setChecked(getattr(cfg, "show_pin_numbers", True))
         self.black = QCheckBox("вся графика и текст чёрные")
@@ -495,6 +657,45 @@ class SettingsDialog(QDialog):
         self.pscale.setValue(int(round(getattr(cfg, "passive_scale", 1.0) * 100)))
         self.pscale.setToolTip("Размер графики резисторов, конденсаторов, "
                                "диодов и прочих двухвыводных элементов")
+        # Кегль превью относительно Altium. Раньше это была зашитая
+        # константа, подобранная на глаз, и подогнать её под свой Altium
+        # было нечем.
+        self.prevfont = QSpinBox()
+        self.prevfont.setRange(40, 150)
+        self.prevfont.setSingleStep(2)
+        self.prevfont.setSuffix(" %")
+        self.prevfont.setValue(
+            int(round(getattr(cfg, "preview_font_scale", 0.72) * 100)))
+        self.prevfont.setToolTip(
+            "Кегль текста в предпросмотре и в редакторе УГО относительно "
+            "того, что получится в Altium.\n"
+            "Меньше 100 % потому, что Altium отмеряет текст по высоте "
+            "прописной буквы, а Qt и SVG — по полной высоте кегля.\n"
+            "Если на схеме подписи крупнее, чем в превью, — увеличьте.")
+        # Подробность 3D. Это настройка СКОРОСТИ СБОРКИ: разбор фасетного
+        # STEP -- самая дорогая операция в Altium.
+        self.mfaces = QSpinBox()
+        self.mfaces.setRange(500, 60000)
+        self.mfaces.setSingleStep(500)
+        self.mfaces.setSuffix(" тр.")
+        self.mfaces.setValue(int(getattr(cfg, "model_faces", 6000)))
+        self.mfaces.setToolTip(
+            "Сколько треугольников оставлять в 3D-модели, которую GostLib "
+            "делает из OBJ.\n"
+            "Это про скорость сборки, а не про картинку: замер на живом "
+            "проекте — модель на ~58 тысяч треугольников Altium вставлял "
+            "в посадочное место 337 секунд, соседняя посадка из 355 "
+            "площадок собралась за 8,5.\n"
+            "6000 на корпусе микросхемы от 60000 на глаз не отличаются.")
+        self.seat3d = QCheckBox("сажать 3D-модели на плоскость платы")
+        self.seat3d.setChecked(bool(getattr(cfg, "seat_models", True)))
+        self.seat3d.setToolTip(
+            "Altium считает Z = 0 плоскостью платы, а модели из EasyEDA "
+            "приходят с началом координат где придётся — отсюда корпуса, "
+            "утонувшие в плате.\n"
+            "Правится только смещение по высоте, сам файл модели не "
+            "трогается.\n"
+            "У выводных корпусов не применяется: там ножки ниже платы.")
         self.autoinst = QCheckBox("подключать библиотеку к Altium автоматически")
         self.autoinst.setChecked(cfg.auto_install_library)
         self.intlib = QCheckBox("собирать .IntLib — одна запись в панели "
@@ -526,6 +727,26 @@ class SettingsDialog(QDialog):
             "Папка share/kicad нужной версии. После смены нажмите "
             "«Обновить индекс KiCad» в окне импорта.")
 
+        # Текстовое зеркало библиотеки: папка, которую ведут в git или
+        # держат в облачной папке отдела.
+        self.git_dir = QLineEdit(getattr(cfg, "git_dir", "") or "")
+        self.git_dir.setPlaceholderText("library-git рядом с каталогом")
+        self.git_dir.setToolTip(
+            "Сюда выкладывается текстовая копия библиотеки: по файлу на "
+            "компонент плюс оглавление.\n"
+            "Это и есть то, что коммитят: JSON читается в pull request, "
+            "сливается по-человечески\nи одинаков при каждой выгрузке.")
+        git_b = QPushButton("…")
+        git_b.setFixedWidth(30)
+        git_b.clicked.connect(self._browse_git)
+        self.git_models = QCheckBox("выкладывать в репозиторий и 3D-модели")
+        self.git_models.setChecked(bool(getattr(cfg, "git_models", False)))
+        self.git_models.setToolTip(
+            "STEP текстовый, git его переваривает, но библиотека на сотню "
+            "корпусов -- это сотни мегабайт.\n"
+            "Обычно модели держат отдельно, а в репозитории только "
+            "описания компонентов.")
+
         self.altium = QLineEdit(cfg.altium_exe)
         alt_b = QPushButton("…")
         alt_b.setFixedWidth(30)
@@ -542,6 +763,11 @@ class SettingsDialog(QDialog):
         f1.addRow("", self.autoinst)
         f1.addRow("", self.intlib)
         f1.addRow("Библиотеки KiCad:", self.kicad_root)
+        hg = QHBoxLayout()
+        hg.addWidget(self.git_dir, 1)
+        hg.addWidget(git_b)
+        f1.addRow("Папка для git:", self._wrap(hg))
+        f1.addRow("", self.git_models)
         tabs.addTab(w1, "Библиотека")
 
         w2 = QWidget(); f2 = QFormLayout(w2)
@@ -558,10 +784,14 @@ class SettingsDialog(QDialog):
         f2.addRow("", self.num_text)
         f2.addRow("", self.pow_marks)
         f2.addRow("", self.fields)
+        f2.addRow("", self.compact)
         f2.addRow("", self.pin_nums)
         f2.addRow("", self.black)
         f2.addRow("Зазор между группами выводов:", self.gap_rows)
         f2.addRow("Размер двухвыводных элементов:", self.pscale)
+        f2.addRow("Кегль в превью (от Altium):", self.prevfont)
+        f2.addRow("Подробность 3D-моделей:", self.mfaces)
+        f2.addRow("", self.seat3d)
         tabs.addTab(w2, "ГОСТ / шрифты")
 
         w3 = QWidget(); f3 = QFormLayout(w3)
@@ -576,7 +806,8 @@ class SettingsDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(tabs)
         lay.addWidget(bb)
-        self.resize(560, 520)
+        from .widgets import fit_to_screen
+        fit_to_screen(self, 560, 520)
 
     @staticmethod
     def _wrap(layout):
@@ -590,6 +821,13 @@ class SettingsDialog(QDialog):
                                              self.out_dir.text())
         if d:
             self.out_dir.setText(d)
+
+    def _browse_git(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Папка текстовой копии библиотеки",
+            self.git_dir.text().strip() or "")
+        if d:
+            self.git_dir.setText(d)
 
     def _browse_altium(self):
         f, _ = QFileDialog.getOpenFileName(self, "Altium Designer",
@@ -617,6 +855,7 @@ class SettingsDialog(QDialog):
         c.pin_numbers_as_text = self.num_text.isChecked()
         c.show_power_marks = self.pow_marks.isChecked()
         c.ic_fields = self.fields.isChecked()
+        c.compact_symbols = self.compact.isChecked()
         c.show_pin_numbers = self.pin_nums.isChecked()
         # список даёт путь в данных пункта; вручную вписанный текст берём
         # как есть -- это тоже путь
@@ -626,6 +865,12 @@ class SettingsDialog(QDialog):
             else txt
         c.group_gap_rows = self.gap_rows.value()
         c.passive_scale = self.pscale.value() / 100.0
+        c.preview_font_scale = self.prevfont.value() / 100.0
+        c.model_faces = self.mfaces.value()
+        c.seat_models = self.seat3d.isChecked()
+        c.git_dir = self.git_dir.text().strip()
+        c.git_models = self.git_models.isChecked()
+
         black = 0 if self.black.isChecked() else None
         if black is not None:
             c.color_graphic = c.color_text = c.color_pin_num = c.color_pin = 0
@@ -656,7 +901,8 @@ class PickComponentsDialog(QDialog):
         pr = svc.db.project(self.pid)
         self.pname = pr["name"] if pr else ""
         self.setWindowTitle(f"Добавить в проект «{self.pname}»")
-        self.resize(900, 560)
+        from .widgets import fit_to_screen
+        fit_to_screen(self, 900, 560)
 
         self.search = QLineEdit()
         self.search.setPlaceholderText(

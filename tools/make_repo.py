@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # Каталоги, которых в репозитории не должно быть ни при каких условиях.
 SKIP_DIRS = {
+    ".git",               # у копии свой репозиторий, чужой сюда не тащим
     ".venv", "venv", "env", "build", "dist", "__pycache__",
     ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
     "_test",              # результаты проверки кругового преобразования
@@ -51,6 +52,7 @@ MUST_HAVE = [
     "README.md",
     "LICENSE",
     ".gitignore",
+    ".gitattributes",   # без него Windows-клон коммитит свои переводы строк
 ]
 
 
