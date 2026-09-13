@@ -3224,6 +3224,28 @@ def check_build_exe_lock(res: Result):
         res.check("неснимаемая блокировка -- отказ, а не падение",
                   ok is False, str(ok))
 
+    # --- размер exe: он зависит от интерпретатора, а не от папки
+    src_text = src.read_text(encoding="utf-8")
+    res.check("есть флаг компактной сборки", '"--slim"' in src_text, "")
+    res.check("есть флаг обязательного 3D", '"--with-3d"' in src_text, "")
+    res.check("в --slim тяжёлые пакеты исключаются явно",
+              '"--exclude-module", mod' in src_text and "numpy" in src_text,
+              "")
+    said = []
+    be.log = said.append
+    try:
+        be.report_env(True)
+    except Exception as e:                                  # noqa: BLE001
+        res.check("отчёт об окружении сборки строится", False, str(e))
+    else:
+        txt = "\n".join(said)
+        res.check("отчёт называет интерпретатор",
+                  "интерпретатор" in txt, txt[:60])
+        res.check("и говорит, окружение это проекта или системное",
+                  "окружение проекта" in txt or "СИСТЕМНЫЙ" in txt, txt[:60])
+    finally:
+        be.log = lambda *_a, **_k: None
+
 
 def check_pin_plan_tidy(res: Result):
     """

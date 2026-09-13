@@ -8,6 +8,15 @@
     python build_exe.py --console       с консолью -- видно traceback и print
     python build_exe.py --clean         снести build/ и dist/ перед сборкой
     python build_exe.py --name MyApp    другое имя exe
+    python build_exe.py --slim          без 3D-пакетов: exe вдвое меньше
+    python build_exe.py --with-3d       не собирать, если 3D-пакетов нет
+
+Размер exe определяется НЕ папкой проекта, а тем, что установлено в
+интерпретаторе, которым запущена сборка. Из проектного .venv с одним
+PySide6 выходит примерно 47 МБ; системный Python, где стоят trimesh,
+cascadio и numpy, даёт 90+ МБ -- и это не мусор, а работающий просмотр
+3D телом. Скрипт печатает состав окружения перед сборкой, чтобы разница
+не выглядела загадкой.
 """
 from __future__ import annotations
 
@@ -291,6 +300,71 @@ def human_size(n: int) -> str:
     return f"{mb:.1f} МБ ({n} байт)"
 
 
+def in_venv() -> bool:
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+
+def pkg_size(name: str) -> int:
+    """Сколько весит пакет на диске -- чтобы объяснить размер exe."""
+    try:
+        res = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.util,os,sys;"
+             f"s=importlib.util.find_spec({name!r});"
+             "p=(s.submodule_search_locations[0] if s and "
+             "s.submodule_search_locations else (s.origin if s else ''));"
+             "t=0\n"
+             "if p and os.path.isdir(p):\n"
+             "    for r,_d,f in os.walk(p):\n"
+             "        for x in f:\n"
+             "            try: t+=os.path.getsize(os.path.join(r,x))\n"
+             "            except OSError: pass\n"
+             "elif p and os.path.isfile(p): t=os.path.getsize(p)\n"
+             "print(t)"],
+            capture_output=True, text=True, timeout=120)
+        return int((res.stdout or "0").strip() or 0)
+    except Exception:
+        return 0
+
+
+def report_env(want_3d: bool) -> None:
+    """
+    Из чего складывается размер exe.
+
+    Вопрос «почему из одной папки 47 МБ, а из другой 90» возникает
+    ровно один раз и всегда с одним ответом: дело не в папке, а в
+    ИНТЕРПРЕТАТОРЕ. Из проектного .venv, где стоит только PySide6,
+    выходит компактный exe; системный Python обычно несёт numpy,
+    trimesh и прочее, и PyInstaller всё это добросовестно упаковывает.
+    Поэтому печатаем состав прямо в начале сборки.
+    """
+    log("Окружение сборки:")
+    log(f"  интерпретатор: {sys.executable}")
+    log(f"  это {'виртуальное окружение проекта' if in_venv() else 'СИСТЕМНЫЙ Python'}")
+    heavy = [("PySide6", "обязателен"), ("olefile", "обязателен"),
+             ("trimesh", "3D телом"), ("cascadio", "STEP -> сетка"),
+             ("numpy", "тянется за trimesh"), ("scipy", "тянется за trimesh"),
+             ("shapely", "тянется за trimesh"), ("PIL", "тянется за trimesh")]
+    total = 0
+    for name, why in heavy:
+        if not have_module(name):
+            continue
+        sz = pkg_size(name)
+        total += sz
+        log(f"  {name:9} {human_size(sz):>22}   {why}")
+    log(f"  итого пакетов на диске: {human_size(total)}")
+    if not in_venv():
+        log("  ВНИМАНИЕ: сборка идёт системным Python -- в exe попадёт всё,")
+        log("  что в нём установлено. Компактную сборку даёт своё окружение:")
+        log("      python -m venv .venv")
+        log("      .venv\\Scripts\\pip install -r requirements.txt")
+        log("      build_exe.bat")
+    if not want_3d:
+        log("  режим --slim: trimesh/cascadio в exe не пойдут "
+            "(3D рисуется своим разбором STEP)")
+    log("")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Сборка GostLib.exe (PyInstaller, один файл)")
@@ -299,6 +373,14 @@ def main() -> int:
     ap.add_argument("--clean", action="store_true",
                     help="удалить build/ и dist/ перед сборкой")
     ap.add_argument("--name", default="GostLib", help="имя exe (без .exe)")
+    # Размер exe зависит не от папки, а от того, что стоит в
+    # интерпретаторе. Даём это решать явно, а не «как повезёт».
+    ap.add_argument("--slim", action="store_true",
+                    help="без trimesh/cascadio: exe вдвое меньше, 3D "
+                         "рисуется своим разбором STEP")
+    ap.add_argument("--with-3d", action="store_true",
+                    help="требовать trimesh и cascadio: без них сборка "
+                         "остановится, а не соберёт молча урезанный exe")
     args = ap.parse_args()
 
     log("=== Сборка GostLib.exe ===")
@@ -320,6 +402,7 @@ def main() -> int:
         return 1
     if not ensure_pyinstaller():
         return 1
+    report_env(not args.slim)
 
     if args.clean:
         for d in (BUILD_DIR, DIST_DIR):
@@ -380,12 +463,26 @@ def main() -> int:
             f"  Поставьте: {sys.executable} -m pip install olefile")
 
     have_3d = []
-    for mod in OPTIONAL_MODULES:
-        if have_module(mod):
-            have_3d.append(mod)
-            cmd += ["--hidden-import", mod, "--collect-all", mod]
-    if len(have_3d) == len(OPTIONAL_MODULES):
-        log("3D-просмотр: включён (trimesh + cascadio)")
+    if not args.slim:
+        for mod in OPTIONAL_MODULES:
+            if have_module(mod):
+                have_3d.append(mod)
+                cmd += ["--hidden-import", mod, "--collect-all", mod]
+    if args.with_3d and len(have_3d) < len(OPTIONAL_MODULES):
+        log("Запрошено --with-3d, но в этом интерпретаторе нет "
+            + ", ".join(m for m in OPTIONAL_MODULES if m not in have_3d))
+        log(f"  Поставьте: {sys.executable} -m pip install trimesh cascadio")
+        return 1
+    if args.slim:
+        log("3D-просмотр телом: НЕ включён (--slim). Программа работает, "
+            "модели рисуются нашим разбором STEP -- каркасом.")
+        # numpy и прочее из окружения без trimesh в exe не нужны
+        for mod in ("trimesh", "cascadio", "numpy", "scipy", "shapely",
+                    "networkx", "PIL", "matplotlib", "pandas"):
+            cmd += ["--exclude-module", mod]
+    elif len(have_3d) == len(OPTIONAL_MODULES):
+        log("3D-просмотр: включён (trimesh + cascadio). Это главная статья "
+            "размера exe: пакеты тянут за собой numpy и данные.")
     elif have_3d:
         log(f"3D-просмотр: частично, есть только {', '.join(have_3d)}. "
             "Конвертация STEP может быть недоступна.")
@@ -432,6 +529,17 @@ def main() -> int:
         log("Это самодостаточный exe: Python и PySide6 внутри, ставить")
         log("ничего не нужно. Первый запуск дольше -- распаковка во")
         log("временную папку.")
+        mb = exe.stat().st_size / (1024 * 1024)
+        if have_3d and mb > 60:
+            log("")
+            log(f"Почему {mb:.0f} МБ, а не ~47: в сборку вошли "
+                f"{' и '.join(have_3d)} вместе с numpy -- это просмотр 3D")
+            log("телом. Нужен компактный exe -- соберите с --slim либо из")
+            log("окружения, где этих пакетов нет.")
+        elif not have_3d and mb < 60:
+            log("")
+            log("Сборка без 3D-пакетов. Просмотр моделей телом работать не")
+            log("будет -- модели рисуются каркасом по нашему разбору STEP.")
         return 0
     log(f"PyInstaller отработал, но {exe} не появился. "
         f"Проверьте содержимое {DIST_DIR}.")
