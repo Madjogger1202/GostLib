@@ -369,7 +369,11 @@ class KicadDialog(QDialog):
                                f"{os.path.basename(mpath)} — {size:.1f} МБ, "
                                f"читаю…")
         from .main_window import ModelWorker
-        w = ModelWorker(mpath, fp, os.path.dirname(mpath), self._prev_token)
+        # Кеш триангуляции кладём в СВОЮ папку моделей, а не рядом с
+        # файлом: библиотеки KiCad лежат в Program Files, и попытка
+        # создать там `_mesh_cache` даёт «[WinError 5] Отказано в
+        # доступе» -- в превью вместо тела появлялась эта строка.
+        w = ModelWorker(mpath, fp, self.svc.cfg.models_dir, self._prev_token)
         w.done.connect(self._model_ready)
         self._prev_worker = w
         w.start()
