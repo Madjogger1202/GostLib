@@ -1078,10 +1078,14 @@ class MainWindow(QMainWindow):
         symrow.addWidget(QLabel("обозначение:"))
         self.cb_src = QComboBox()
         self.cb_src.addItem("рисовать по ГОСТ", "gost")
-        self.cb_src.addItem("как в источнике (KiCad)", "native")
+        self.cb_src.addItem("как в источнике (KiCad, EasyEDA)", "native")
         self.cb_src.setToolTip(
-            "Пассивки в KiCad уже нарисованы по делу — перерисовывать их "
-            "незачем. Микросхемы там безликие коробки, их рисуем сами.\n"
+            "Пассивка и дискретная мелочь в KiCad и EasyEDA уже нарисованы "
+            "по делу — перерисовывать их незачем. Микросхемы там безликие "
+            "коробки, их рисуем сами.\n"
+            "Родное обозначение бывает единственно верным: у ESD5471X это "
+            "двунаправленный супрессор, а по списку выводов он неотличим от "
+            "обычного диода.\n"
             "Если тип определился неверно, переключите здесь.")
         self.cb_src.currentIndexChanged.connect(self._set_symbol_source)
         symrow.addWidget(self.cb_src)
@@ -1852,7 +1856,7 @@ class MainWindow(QMainWindow):
         self.on_select()
 
     def do_refresh_native(self):
-        """Забрать родную графику из исходного .kicad_sym заново."""
+        """Забрать родную графику из источника заново: .kicad_sym или LCSC."""
         uids = self.selected_uids()
         if not uids:
             return
@@ -1879,8 +1883,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, "GostLib",
                 "У этого компонента нет сохранённого обозначения из "
-                "источника — его нечего показать. Переимпортируйте его из "
-                "KiCad, и родное УГО сохранится вместе с компонентом.")
+                "источника — его нечего показать. Возьмите «Перечитать УГО "
+                "из источника» в контекстном меню или переимпортируйте "
+                "компонент: родное УГО сохранится вместе с ним.")
             self._fill_own_style(c)
             return
         c.symbol_source = src

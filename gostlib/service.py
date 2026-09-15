@@ -418,11 +418,11 @@ class Service:
 
     def refresh_native(self, uid: str) -> Optional[Component]:
         """
-        Перечитать родное обозначение из исходного .kicad_sym.
+        Перечитать родное обозначение из источника: .kicad_sym или EasyEDA.
 
         Компоненты, импортированные до появления родной графики, её не
         имеют -- переключатель «как в источнике» у них пустой. Здесь мы
-        находим исходный файл по source_ref и забираем графику и позиции
+        находим исходный символ по source_ref и забираем графику и позиции
         выводов заново, ничего больше не трогая.
         """
         c = self.db.get(uid)
@@ -430,6 +430,12 @@ class Service:
             return None
         self._snap(uid, "Перечитать УГО из источника")
         ref = c.source_ref or ""
+        if (c.source or "").lower() == "easyeda" and ref:
+            # У компонента из LCSC исходник -- ответ EasyEDA, а он лежит в
+            # кеше: перечитать УГО можно и без сети.
+            fresh = easyeda.fetch(ref, want_3d=False, log=self.log,
+                                  cache_dir=self.cfg.cache_dir)
+            return self._take_native(c, fresh, f"EasyEDA {ref}")
         if "::" not in ref:
             raise ValueError(f"{c.name}: неизвестно, откуда он импортирован")
         fname, sym_name = ref.split("::", 1)
@@ -447,14 +453,19 @@ class Service:
             raise FileNotFoundError(
                 f"{c.name}: файл {fname} не найден. Обновите индекс KiCad.")
         fresh = kc.component_from_kicad_sym(path, sym_name)
+        return self._take_native(c, fresh, os.path.basename(path))
+
+    def _take_native(self, c: Component, fresh: Component,
+                     origin: str) -> Component:
+        """Забрать родную графику из свежеразобранного источника."""
         c.native_prims = list(fresh.native_prims)
         c.native_pins = list(fresh.native_pins)
         if not c.native_prims:
-            self.log(f"{c.name}: в {fname} у символа нет своей графики")
+            self.log(f"{c.name}: в {origin} у символа нет своей графики")
         c.symbol.manual_layout = False
         self.rebuild_symbol(c)
         self.db.upsert(c)
-        self.log(f"{c.name}: обозначение перечитано из {os.path.basename(path)}"
+        self.log(f"{c.name}: обозначение перечитано из {origin}"
                  f" ({len(c.native_prims)} фигур, {len(c.native_pins)} выводов)")
         return c
 

@@ -1518,6 +1518,84 @@ def check_kicad(res: Result):
                   svg.footprint_svg(fp).startswith("<svg"))
 
 
+def _check_easyeda_symbol(res: Result, ee):
+    """
+    Родное УГО из EasyEDA.
+
+    Живой повод: ESD5471X (C3011180) -- двунаправленный супрессор, у него в
+    источнике два встречных треугольника. По одному списку выводов его от
+    обычного диода не отличить, и в библиотеку уезжал простой диод.
+    """
+    # символ ESD5471X как его отдаёт EasyEDA (начало координат 170;20)
+    shapes = [
+        "PT~M 160 13 L 170 20 L 160 27 Z ~#880000~1~0~none~gge110~0~",
+        "PT~M 180 13 L 170 20 L 180 27 Z ~#880000~1~0~none~gge113~0~",
+        "PL~168 10 168 10 170 13 170 27 172 30 172 30~#880000~1~0~none~gge116~0",
+        "R~160~10~~~20~20~#000000~1~0~none~gge117~0~",
+        "E~170~20~2~2~#880000~1~0~#880000~gge118~0",
+        "T~L~170~40~0~#0000FF~Tahoma~11.5pt~0.1~~middle~comment~ESD5471X~1~"
+        "middle~gge860~0~pinpart",
+        "T~L~170~50~0~#0000FF~Tahoma~7pt~0.1~~start~0~2 kV~1~middle~gge861~0~",
+        "P~show~0~1~150~20~180~gge119~0^^150~20^^M 150 20 h 10~#880000^^"
+        "0~163~23~0~1~start~~~#0000FF^^0~157~19~0~1~end~~~#0000FF",
+        "P~show~0~2~190~20~0~gge140~0^^190~20^^M 190 20 h -10~#880000^^"
+        "0~177~23~0~2~end~~~#0000FF^^0~183~19~0~2~start~~~#0000FF",
+    ]
+    prims = ee._sym_graphics(shapes, 1, 170.0, 20.0)
+    kinds = [p.kind for p in prims]
+    res.check("EasyEDA: графика символа разобрана",
+              kinds == ["poly", "poly", "poly", "rect", "ellipse", "text"],
+              str(kinds))
+    tri = [p for p in prims if p.kind == "poly"][:2]
+    res.check("EasyEDA: треугольники супрессора замкнуты",
+              all(len(p.pts) == 4 and p.pts[0] == p.pts[-1] for p in tri),
+              str([p.pts for p in tri]))
+    # ось Y у EasyEDA смотрит вниз: точка НАД началом координат обязана
+    # получить положительный Y, иначе обозначение приезжает зеркальным
+    res.check("EasyEDA: ось Y перевёрнута",
+              tri[0].pts[0] == [-100, 70], str(tri[0].pts))
+    rect = [p for p in prims if p.kind == "rect"][0]
+    res.check("EasyEDA: прямоугольник от угла и размера",
+              rect.pts == [[-100, 100], [100, -100]], str(rect.pts))
+    ell = [p for p in prims if p.kind == "ellipse"][0]
+    res.check("EasyEDA: круг залит",
+              ell.filled and abs(ell.radius - 20) < 1e-6,
+              f"{ell.filled}/{ell.radius}")
+    # Comment программа ставит сама и его можно двигать по листу; копия
+    # графикой намертво прибита к обозначению -- дубликат подписи
+    txt = [p for p in prims if p.kind == "text"]
+    res.check("EasyEDA: подпись Comment не дублируется графикой",
+              len(txt) == 1 and txt[0].text == "2 kV",
+              str([p.text for p in txt]))
+
+    pins = ee._parse_pins(shapes, 1, 170.0, 20.0)
+    npins = ee.native_pins(pins)
+    res.check("EasyEDA: вывод встаёт туда же, где в источнике",
+              [(p.x, p.y, p.rotation, p.length, p.side) for p in npins]
+              == [(-100, 0, 180, 100, "L"), (100, 0, 0, 100, "R")],
+              str([(p.x, p.y, p.rotation, p.length) for p in npins]))
+    # у ГОСТ-раскладки своё место для выводов -- геометрия источника не
+    # должна протекать в обычные выводы компонента
+    res.check("EasyEDA: место из источника не трогает обычные выводы",
+              all(p.x == 0 and p.y == 0 for p in pins),
+              str([(p.x, p.y) for p in pins]))
+
+    # Линия вывода нарисована в обе стороны: у конденсатора CL05B104 (C1525)
+    # она идёт от корпуса к выводу, а не наоборот. Раньше конец у корпуса
+    # брался «последней точкой пути», и вывод уезжал на свою длину.
+    back = ["P~show~0~2~30~20~0~gge29~0^^30~20^^M 20 20 h 10~#800^^"
+            "0~16~20~0~2~end~~~#800^^0~24~16~0~2~start~~~#800"]
+    q = ee.native_pins(ee._parse_pins(back, 1, 10.0, 20.0))[0]
+    res.check("EasyEDA: линия вывода нарисована от корпуса",
+              (q.x, q.y, q.rotation, q.length) == (100, 0, 0, 100),
+              str((q.x, q.y, q.rotation, q.length)))
+
+    _pins, _n, sprims = ee._parse_symbol(
+        {"dataStr": {"head": {"x": 170, "y": 20}, "shape": shapes}})
+    res.check("EasyEDA: графика доезжает до символа",
+              len(sprims) == len(prims), f"{len(sprims)}/{len(prims)}")
+
+
 def check_easyeda(res: Result):
     from .sources import easyeda as ee
     shapes = ["P~show~1~1~-30~-10~0~gge12~0^^-40~-10^^M -30 -10 h -10~#880000^^"
@@ -1534,10 +1612,11 @@ def check_easyeda(res: Result):
         {"title": "TEST.2", "dataStr": {"head": {"c_para": {
             "subpart_no": "2"}}, "shape": shapes}},
     ]}
-    mpins, nparts = ee._parse_symbol(multi)
+    mpins, nparts, _mprims = ee._parse_symbol(multi)
     res.check("EasyEDA: многосекционный символ",
               nparts == 2 and [p.unit for p in mpins] == [1, 2],
               str((nparts, [p.unit for p in mpins])))
+    _check_easyeda_symbol(res, ee)
     a = ee._arc_from_path("M 100 100 A 20 20 0 0 1 140 100")
     res.check("EasyEDA: дуга из пути", a is not None and abs(a[2] - 20) < 1.0,
               str(a))

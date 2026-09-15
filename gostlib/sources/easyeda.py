@@ -2,7 +2,8 @@
 Импорт из EasyEDA / LCSC (JLCPCB).
 
 По коду вида C2040 тянется компонент из открытого API EasyEDA Standard:
-символ (нужен только список выводов -- графика рисуется заново по ГОСТ),
+символ (список выводов и родная графика -- по ГОСТ рисуется заново,
+но родное обозначение сохраняется и его можно выбрать),
 посадочное место (переносится геометрически) и, по возможности, 3D-модель.
 
 EasyEDA отдаёт 3D в формате OBJ; Altium понимает STEP, поэтому OBJ
@@ -19,7 +20,8 @@ import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 from .. import classify
-from ..ir import Component, Footprint, FpPrim, Model3D, Pad, SymPin, Symbol
+from ..ir import (Component, Footprint, FpPrim, Model3D, Pad, SymPin,
+                  SymPrim, Symbol)
 
 API_COMPONENT = ("https://easyeda.com/api/products/{code}/components"
                  "?version=6.4.19.5")
@@ -161,7 +163,155 @@ def fetch_raw(code: str, cache_dir: str = "", log=None) -> dict:
 
 # ----------------------------------------------------------------- символ ----
 
-def _parse_pins(shapes: List[str], unit: int = 1) -> List[SymPin]:
+# Текстовые поля, которые EasyEDA рисует графикой, а мы ставим своими
+# средствами: обозначение и подпись приезжают в Altium штатными Designator
+# и Comment, и дубликат графикой только мешает -- его можно двигать, а
+# копию нельзя.
+_SKIP_TEXT = ("comment", "name", "prefix", "part", "spice")
+
+# Длина вывода по умолчанию, в единицах EasyEDA (1 единица = 10 mil).
+DEF_PIN = 10.0
+
+_SIDE = {180: "L", 0: "R", 90: "T", 270: "B"}
+
+
+def _lw(v) -> int:
+    """Толщина линии EasyEDA (пиксели) в шкалу Altium: 1=Small..3=Large."""
+    return max(1, min(3, int(round(_f(v, 1.0))) or 1))
+
+
+def _is_filled(v) -> bool:
+    return str(v or "").strip().lower() not in ("", "none", "transparent")
+
+
+def _sym_graphics(shapes: List[str], unit: int,
+                  ox: float, oy: float) -> List[SymPrim]:
+    """
+    Графика символа EasyEDA как есть: прямоугольники, окружности, ломаные,
+    заливки, дуги и подписи.
+
+    Нужна там, где обозначение из источника само по себе верное и
+    перерисовывать его по ГОСТ нечем: у двунаправленного супрессора
+    (ESD5471X) это два встречных треугольника, и обычный диод вместо них --
+    враньё в схеме.
+
+    Ось Y у EasyEDA смотрит вниз, у нас вверх: Y меняет знак, а вместе с
+    ним и углы дуг. Начало координат символа лежит в ``dataStr.head``.
+    """
+    out: List[SymPrim] = []
+
+    def X(v):
+        return int(round((_f(v) - ox) * UNIT_MIL))
+
+    def Y(v):
+        return int(round(-(_f(v) - oy) * UNIT_MIL))
+
+    def D(v):
+        return _f(v) * UNIT_MIL
+
+    def path_pts(path: str) -> List[List[float]]:
+        pts = [[X(p[0]), Y(p[1])] for p in _svg_path_points(path)]
+        # EasyEDA охотно пишет одну и ту же точку подряд -- в Altium это
+        # линия нулевой длины, то есть точка посреди обозначения.
+        return [p for i, p in enumerate(pts) if i == 0 or p != pts[i - 1]]
+
+    for sh in shapes:
+        f = str(sh).split("~")
+        kind = f[0]
+        try:
+            if kind == "R" and len(f) > 10:
+                x, y = _f(f[1]), _f(f[2])
+                w, h = _f(f[5]), _f(f[6])
+                out.append(SymPrim(kind="rect", unit=unit,
+                                   pts=[[X(x), Y(y)], [X(x + w), Y(y + h)]],
+                                   width=_lw(f[8]), filled=_is_filled(f[10])))
+            elif kind == "E" and len(f) > 8:
+                out.append(SymPrim(kind="ellipse", unit=unit,
+                                   pts=[[X(f[1]), Y(f[2])]],
+                                   radius=(D(f[3]) + D(f[4])) / 2.0,
+                                   width=_lw(f[6]), filled=_is_filled(f[8])))
+            elif kind in ("PL", "PG", "PT") and len(f) > 5:
+                pts = path_pts(f[1])
+                if len(pts) < 2:
+                    continue
+                closed = kind in ("PG", "PT") or "Z" in f[1].upper()
+                if closed and pts[0] != pts[-1]:
+                    pts.append(list(pts[0]))
+                out.append(SymPrim(kind="poly", unit=unit, pts=pts,
+                                   width=_lw(f[3]), filled=_is_filled(f[5])))
+            elif kind == "A" and len(f) > 5:
+                arc = _arc_from_path(f[1])
+                if arc:
+                    cx, cy, r, a1, a2 = arc
+                    out.append(SymPrim(kind="arc", unit=unit,
+                                       pts=[[X(cx), Y(cy)]], radius=D(r),
+                                       a1=-a2, a2=-a1, width=_lw(f[3])))
+                    continue
+                pts = path_pts(f[1])
+                if len(pts) >= 2:
+                    out.append(SymPrim(kind="poly", unit=unit, pts=pts,
+                                       width=_lw(f[3])))
+            elif kind == "T" and len(f) > 12:
+                if str(f[11]).strip().lower() in _SKIP_TEXT:
+                    continue
+                if len(f) > 13 and str(f[13]).strip() == "0":
+                    continue
+                body = str(f[12]).strip()
+                if not body:
+                    continue
+                just = {"start": 0, "middle": 1, "end": 2}.get(
+                    str(f[10]).strip().lower(), 0)
+                size = int(round(_f(str(f[7]).lower().replace("pt", ""), 7.0)))
+                out.append(SymPrim(kind="text", unit=unit, text=body,
+                                   pts=[[X(f[2]), Y(f[3])]],
+                                   size=max(6, size),
+                                   rotation=int(round(_f(f[4]))) % 360,
+                                   justify=just, vjustify=0))
+        except (IndexError, ValueError):
+            continue
+    return out
+
+
+def _place_pin(p: SymPin, head: List[str], segs: List[str],
+               ox: float, oy: float) -> None:
+    """
+    Запомнить, где вывод стоит в EasyEDA.
+
+    В EasyEDA координата вывода -- его СВОБОДНЫЙ конец, а линия из второго
+    сегмента ("M x y h 10") идёт от него к корпусу. У нас наоборот:
+    координата -- конец у корпуса, поворот смотрит наружу. Угол EasyEDA
+    отсчитывает против часовой стрелки на экране, поэтому после смены знака
+    Y он совпадает с нашим один в один.
+
+    Геометрия кладётся в служебное поле, а не в сам вывод: по ГОСТ выводы
+    раскладываются заново, и место из источника там только мешало бы.
+    """
+    if len(head) < 7:
+        return
+    ex, ey = _f(head[4]), _f(head[5])
+    rot = int(round(_f(head[6]))) % 360
+    bx = by = None
+    if len(segs) > 2:
+        # Линия вывода нарисована в любую сторону: у одного компонента она
+        # идёт от свободного конца к корпусу ("M 150 20 h 10"), у соседнего
+        # наоборот ("M 20 20 h 10" при выводе в точке 30). Значит, конец у
+        # корпуса -- это тот конец линии, который НЕ совпадает с точкой
+        # вывода, а не просто последний.
+        pts = _svg_path_points(segs[2].split("~")[0])
+        for cand in (pts[-1:] + pts[:1]) if pts else []:
+            if abs(cand[0] - ex) > 1e-6 or abs(cand[1] - ey) > 1e-6:
+                bx, by = cand
+                break
+    if bx is None:
+        a = math.radians(rot + 180)          # от свободного конца к корпусу
+        bx, by = ex + DEF_PIN * math.cos(a), ey - DEF_PIN * math.sin(a)
+    ln = int(round(math.hypot(bx - ex, by - ey) * UNIT_MIL)) or 100
+    p._ee = (int(round((bx - ox) * UNIT_MIL)),      # type: ignore[attr-defined]
+             int(round(-(by - oy) * UNIT_MIL)), rot, ln)
+
+
+def _parse_pins(shapes: List[str], unit: int = 1,
+                ox: float = 0.0, oy: float = 0.0) -> List[SymPin]:
     """Разобрать выводы одной секции EasyEDA."""
     pins: List[SymPin] = []
     for sh in shapes:
@@ -187,10 +337,31 @@ def _parse_pins(shapes: List[str], unit: int = 1) -> List[SymPin]:
         if len(segs) > 6:
             f = segs[6].split("~")
             clock = bool(f and f[0] not in ("", "0"))
-        pins.append(SymPin(number=str(number).strip(), name=str(name).strip(),
-                           etype=etype, unit=max(1, int(unit or 1)),
-                           inverted=inverted, clock=clock))
+        p = SymPin(number=str(number).strip(), name=str(name).strip(),
+                   etype=etype, unit=max(1, int(unit or 1)),
+                   inverted=inverted, clock=clock)
+        _place_pin(p, head, segs, ox, oy)
+        pins.append(p)
     return pins
+
+
+def native_pins(pins: List[SymPin]) -> List[SymPin]:
+    """Копии выводов, поставленные туда, где они стоят в EasyEDA."""
+    out: List[SymPin] = []
+    for p in pins:
+        q = SymPin(**{k: v for k, v in p.__dict__.items()
+                      if k in SymPin.__dataclass_fields__})
+        geo = getattr(p, "_ee", None)
+        if geo:
+            q.x, q.y, q.rotation, q.length = geo
+            q.side = _SIDE.get(int(round(q.rotation / 90.0)) * 90 % 360, "L")
+        out.append(q)
+    return out
+
+
+def _origin(ds: dict) -> Tuple[float, float]:
+    head = ds.get("head") or {}
+    return _f(head.get("x"), 0.0), _f(head.get("y"), 0.0)
 
 
 def _subpart_number(subpart: dict, fallback: int) -> int:
@@ -212,7 +383,7 @@ def _subpart_number(subpart: dict, fallback: int) -> int:
     return max(1, int(fallback or 1))
 
 
-def _parse_symbol(result: dict) -> Tuple[List[SymPin], int]:
+def _parse_symbol(result: dict) -> Tuple[List[SymPin], int, List[SymPrim]]:
     """
     Разобрать символ, включая многосекционные компоненты EasyEDA.
 
@@ -220,21 +391,34 @@ def _parse_symbol(result: dict) -> Tuple[List[SymPin], int]:
     многосекционного родительский ``shape`` пуст, а настоящие символы лежат
     в ``result.subparts``. Раньше такой компонент импортировался с нулём
     выводов.
+
+    Кроме выводов забираем графику: она нужна тем компонентам, чьё
+    обозначение из источника мы не перерисовываем.
     """
     subparts = [p for p in (result.get("subparts") or [])
                 if isinstance(p, dict)]
     if not subparts:
         ds = result.get("dataStr") or {}
-        return _parse_pins(ds.get("shape") or [], 1), 1
+        ox, oy = _origin(ds)
+        shapes = ds.get("shape") or []
+        return (_parse_pins(shapes, 1, ox, oy), 1,
+                _sym_graphics(shapes, 1, ox, oy))
 
     pins: List[SymPin] = []
+    prims: List[SymPrim] = []
     units: List[int] = []
     for fallback, subpart in enumerate(subparts, 1):
         unit = _subpart_number(subpart, fallback)
         units.append(unit)
         ds = subpart.get("dataStr") or {}
-        pins.extend(_parse_pins(ds.get("shape") or [], unit))
-    return pins, max(units or [1])
+        # у каждой секции своё начало координат -- в Altium это отдельная
+        # часть, и считать их от общего начала значило бы развести части
+        # по листу на сотни милов
+        ox, oy = _origin(ds)
+        shapes = ds.get("shape") or []
+        pins.extend(_parse_pins(shapes, unit, ox, oy))
+        prims.extend(_sym_graphics(shapes, unit, ox, oy))
+    return pins, max(units or [1]), prims
 
 
 def _f(v, default=0.0) -> float:
@@ -483,10 +667,17 @@ def fetch(code: str, out_dir: str = "", want_3d: bool = True,
     if para.get("package"):
         c.params["Package"] = para["package"]
 
-    pins, part_count = _parse_symbol(res)
+    pins, part_count, prims = _parse_symbol(res)
     c.raw_pins = pins
     c.symbol = Symbol(part_count=part_count, pins=list(pins))
     c.params["PinCount"] = str(len(pins))
+    # Родное обозначение EasyEDA кладём рядом с ГОСТ-символом. Для диодов,
+    # супрессоров, транзисторов и прочей дискретной мелочи оно и есть
+    # рабочее: у двунаправленного ESD в источнике нарисованы два встречных
+    # треугольника, а по одному лишь списку выводов его от обычного диода
+    # не отличить.
+    c.native_prims = prims
+    c.native_pins = native_pins(pins)
 
     pkg = res.get("packageDetail") or {}
     model_uuid = ""
@@ -504,6 +695,9 @@ def fetch(code: str, out_dir: str = "", want_3d: bool = True,
     c.ctype = classify.guess_type(c.name, c.description, "", pins,
                                   pkg_name, ee_pre, pkg_name)
     c.designator = classify.CTYPE_PREFIX.get(c.ctype, "U") + "?"
+    c.symbol_source = ("native" if prims and any(getattr(p, "_ee", None)
+                                                 for p in pins)
+                       and classify.keeps_native_symbol(c.ctype) else "gost")
 
     if want_3d and model_uuid and out_dir:
         t1 = _time.time()
