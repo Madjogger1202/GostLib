@@ -1133,6 +1133,46 @@ def check_backup_and_clear(res: Result):
                   "файл остался")
 
 
+def check_view_budget(res: Result):
+    """
+    Бюджеты просмотра 3D.
+
+    Живой повод: разъём FH12-40S (40 контактов, шаг 0,5 мм) при бюджете
+    в 5000 треугольников разваливался -- клеточное упрощение сваривало
+    соседние контакты, и вместо модели получались рваные поверхности.
+    """
+    from . import mesh3d
+    res.check("бюджет 3D: сложная модель помещается целиком",
+              mesh3d.MAX_TRIS >= 20000, str(mesh3d.MAX_TRIS))
+    res.check("бюджет 3D: огрубление допуска останавливается на полке",
+              mesh3d.TOL_TRIES >= 3 and mesh3d.TOL_GROWTH >= 2.0
+              and 0 < mesh3d.TOL_STALL < 0.5,
+              f"{mesh3d.TOL_TRIES} заходов x{mesh3d.TOL_GROWTH}, "
+              f"полка {mesh3d.TOL_STALL}")
+    try:
+        from .gui import view3d
+    except Exception as e:
+        res.check("бюджет 3D: окно просмотра импортируется", False, str(e))
+        return
+    # Окно режет сетку своим потолком. Если он ниже, чем у mesh3d, вся
+    # бережная работа mesh3d выбрасывается прямо на входе в окно.
+    res.check("потолок окна не ниже потолка сетки",
+              view3d.MAX_FACES >= mesh3d.MAX_TRIS,
+              f"{view3d.MAX_FACES} < {mesh3d.MAX_TRIS}")
+    res.check("в движении рисуется меньше граней, чем в покое",
+              0 < view3d.DRAG_FACES < view3d.MAX_FACES,
+              f"{view3d.DRAG_FACES} из {view3d.MAX_FACES}")
+    # Прореживание обязано оставлять КРУПНЫЕ грани: «каждый k-й
+    # треугольник» дырявит тело.
+    big = [((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (0.0, 10.0, 0.0)),
+           ((0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.0, 0.1, 1.0)),
+           ((0.0, 0.0, 2.0), (8.0, 0.0, 2.0), (0.0, 8.0, 2.0)),
+           ((0.0, 0.0, 3.0), (0.1, 0.0, 3.0), (0.0, 0.1, 3.0))]
+    keep = sorted(view3d._biggest(big, 2))
+    res.check("прореживание оставляет крупные грани", keep == [0, 2],
+              str(keep))
+
+
 def check_mesh_size(res: Result):
     """Конвертер OBJ->STEP не должен раздувать файл до неразбираемого."""
     import tempfile
@@ -1935,6 +1975,40 @@ def check_pcblib_writer(res: Result):
                       gh == nprim + 1, f"{gh} vs {nprim}+1")
         finally:
             o3.close()
+    # Чтение .PcbLib для импорта: из чужой библиотеки нужна не только
+    # табличка с именем, но и сама посадка -- иначе компонент из архива
+    # выглядит так, будто приехал один символ: ни превью, ни габаритов.
+    from .sources import altium as al
+    with tempfile.TemporaryDirectory() as td4:
+        lp4 = os.path.join(td4, "R.PcbLib")
+        write_pcblib(lp4, [fp])
+        got = al.read_pcblib(lp4)
+    res.check("чтение .PcbLib: посадка найдена", "SELFTEST_FP" in got,
+              str(list(got)))
+    if "SELFTEST_FP" in got:
+        rd = got["SELFTEST_FP"]
+        res.check("чтение .PcbLib: площадки с координатами",
+                  len(rd.pads) == len(fp.pads)
+                  and all(abs(a.x - b.x) < 1e-3 and abs(a.y - b.y) < 1e-3
+                          and abs(a.w - b.w) < 1e-3 and abs(a.h - b.h) < 1e-3
+                          and a.number == b.number
+                          for a, b in zip(rd.pads, fp.pads)),
+                  f"{len(rd.pads)} из {len(fp.pads)}")
+        res.check("чтение .PcbLib: сквозная площадка осталась сквозной",
+                  any(p.hole > 0 and p.layer == "multi" for p in rd.pads),
+                  str([(p.number, p.hole, p.layer) for p in rd.pads]))
+        res.check("чтение .PcbLib: графика прочиталась",
+                  len(rd.prims) >= 5
+                  and {p.layer for p in rd.prims} <= {
+                      "silk", "silk_bot", "assy", "courtyard", "keepout",
+                      "mech", "copper_top", "copper_bot"},
+                  f"{len(rd.prims)} шт., слои "
+                  f"{sorted({p.layer for p in rd.prims})}")
+        res.check("чтение .PcbLib: слои маски и пасты не берутся",
+                  not [p for p in rd.prims
+                       if p.layer in ("paste", "mask", "paste_bot",
+                                      "mask_bot")], "")
+
     res.check("PcbLib: посадка на месте", "SELFTEST_FP" in back, str(list(back)))
     if "SELFTEST_FP" not in back:
         return
@@ -2731,6 +2805,7 @@ def run(st=None) -> Result:
     res.run("скорость подготовки задания", lambda: check_build_speed(res))
     res.run("бюджет 3D-модели", lambda: check_model_budget(res))
     res.run("крупные 3D-модели", lambda: check_heavy_models(res))
+    res.run("бюджет просмотра 3D", lambda: check_view_budget(res))
     res.run("посадка 3D на плату", lambda: check_model_seating(res))
     res.run("цвет модели держится",
             lambda: check_model_color_sticks(res))

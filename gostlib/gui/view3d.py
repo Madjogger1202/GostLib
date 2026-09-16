@@ -26,8 +26,17 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox,
 
 Point = Tuple[float, float, float]
 
-MAX_FACES = 6000
+# Потолок граней у окна. Должен быть не ниже mesh3d.MAX_TRIS: сетку
+# готовит mesh3d, и резать её ещё раз здесь -- значит портить то, что там
+# бережно строили. Это предохранитель для чужих OBJ и STL.
+MAX_FACES = 32000
 MAX_EDGES = 6000
+
+# Сколько граней рисовать, пока модель тащат мышью. Кадр стоит примерно
+# линейно числу граней, поэтому в движении показываем только самые
+# крупные: силуэт и корпус на месте, мелочь появляется, как только
+# кнопку отпустили.
+DRAG_FACES = 4000
 
 
 def _rot(p: Point, rx: float, ry: float, rz: float) -> Point:
@@ -77,6 +86,7 @@ class Scene3D(QWidget):
         self._pl_cent = []        # центры граней -- для сортировки по глубине
         self._pl_col = []         # готовый QColor каждой грани
         self._pl_nrm = []         # нормали -- по ним отбрасываем изнанку
+        self._pl_big = []         # самые крупные грани -- для вращения
         self._model_bounds = None  # min/max уже преобразованной модели
         self._busy = False        # идёт перетаскивание -- рисуем упрощённо
         self.setMinimumSize(240, 200)
@@ -94,8 +104,9 @@ class Scene3D(QWidget):
             # заранее упрощает поверхность без дыр, но GUI никогда не должен
             # получить десятки тысяч полигонов и подвиснуть при движении.
             if len(tris) > MAX_FACES:
-                step = len(tris) / float(MAX_FACES)
-                take = [int(i * step) for i in range(MAX_FACES)]
+                # Не «каждый k-й»: так в теле появляются дыры. Оставляем
+                # самые крупные грани -- они и держат форму.
+                take = sorted(_biggest(tris, MAX_FACES))
                 tris = [tris[i] for i in take]
                 cols = [cols[i] for i in take if i < len(cols)]
             self.faces = [list(t) for t in tris]
@@ -120,8 +131,7 @@ class Scene3D(QWidget):
         if model is not None and getattr(model, "ok", False):
             fc = list(getattr(model, "faces", []) or [])
             if len(fc) > MAX_FACES:
-                step = len(fc) / float(MAX_FACES)
-                fc = [fc[int(i * step)] for i in range(MAX_FACES)]
+                fc = [fc[i] for i in sorted(_biggest(fc, MAX_FACES))]
             self.faces = fc
             ed = list(model.edges or [])
             if len(ed) > MAX_EDGES:
@@ -279,6 +289,9 @@ class Scene3D(QWidget):
             nrms.append(nv)
         self._pl_faces, self._pl_cent = faces, cents
         self._pl_col, self._pl_nrm = cols, nrms
+        # Кого рисовать в движении: считаем один раз здесь, а не на кадр.
+        self._pl_big = (_biggest(faces, DRAG_FACES)
+                        if len(faces) > DRAG_FACES else [])
         self._model_bounds = ((min(xs), min(ys), min(zs),
                                max(xs), max(ys), max(zs))
                               if xs else None)
@@ -380,7 +393,10 @@ class Scene3D(QWidget):
             # Направление на зрителя: у функции depth больший результат --
             # ближе, значит её градиент и есть взгляд.
             vx, vy, vz = sa * ce, ca * ce, se
-            idx = range(len(polys))
+            # В движении крупной модели показываем только крупные грани:
+            # иначе кадр упирается в число полигонов и вращение вязнет.
+            idx = (self._pl_big if self._busy and self._pl_big
+                   else range(len(polys)))
             if len(nrms) == len(polys):
                 vis = [i for i in idx
                        if nrms[i][0] * vx + nrms[i][1] * vy
@@ -417,6 +433,27 @@ class Scene3D(QWidget):
                    f"вид {self.az:.0f}°/{self.el:.0f}°   "
                    f"модель: поворот {t['rx']:.0f}/{t['ry']:.0f}/{t['rz']:.0f}°, "
                    f"сдвиг {t['dx']:.2f}/{t['dy']:.2f}/{t['dz']:.2f} мм")
+
+
+def _area(f: Sequence[Point]) -> float:
+    """Удвоенная площадь грани -- сравнивать между собой этого хватает."""
+    if len(f) < 3:
+        return 0.0
+    ax, ay, az = f[0]
+    bx, by, bz = f[1]
+    cx, cy, cz = f[2]
+    ux, uy, uz = bx - ax, by - ay, bz - az
+    vx, vy, vz = cx - ax, cy - ay, cz - az
+    nx = uy * vz - uz * vy
+    ny = uz * vx - ux * vz
+    nz = ux * vy - uy * vx
+    return math.sqrt(nx * nx + ny * ny + nz * nz)
+
+
+def _biggest(faces, limit: int) -> List[int]:
+    """Номера limit самых крупных граней."""
+    order = sorted(range(len(faces)), key=lambda i: -_area(faces[i]))
+    return order[:limit]
 
 
 def _normal(f: Sequence[Point]) -> Point:

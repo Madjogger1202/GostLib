@@ -3,9 +3,13 @@
 
 Нужно, чтобы «переварить» готовые библиотеки от Ultra Librarian, SnapEDA,
 Component Search Engine и т.п.: из .SchLib берём список выводов (номер, имя,
-электрический тип, секция), из .PcbLib -- список имён посадочных мест.
+электрический тип, секция), из .PcbLib -- имена посадочных мест и их
+геометрию: площадки, линии, дуги, заливки.
+
 Графика символа не читается: символ всё равно перерисовывается по ГОСТ.
-Посадочное место переносится в целевую библиотеку самим Altium (копированием).
+Посадочное место в целевую библиотеку переносит сам Altium (копированием
+из исходной библиотеки) -- геометрия нужна, чтобы её было видно в
+программе: превью, габариты, число площадок, посадка 3D-модели.
 
 Формат .SchLib: OLE-контейнер, поток <Component>/Data состоит из записей
     uint16 length; uint16 type;  payload[length]
@@ -14,6 +18,7 @@ type = 0x100 -- бинарная запись (вывод, RECORD=2)
 """
 from __future__ import annotations
 
+import copy
 import os
 import re
 import struct
@@ -25,7 +30,9 @@ try:
 except ImportError:  # подскажем понятно
     olefile = None
 
-from ..ir import ETYPES, Component, Footprint, SymPin, Symbol
+from ..ir import (ETYPES, Component, Footprint, FpPrim, Pad,
+                  SymPin, Symbol)
+from .easyeda import DERIVED_LAYERS
 from .. import classify
 
 _SWAP_RE = re.compile(r"^\d+\|&\|")
@@ -221,6 +228,133 @@ def read_pcblib_names(path: str) -> List[str]:
         ole.close()
 
 
+# ------------------------------------------------- геометрия .PcbLib ---------
+
+# Внутренняя единица Altium -- 1/10000 мила.
+PCB_UNITS_PER_MM = 10000.0 / 0.0254
+
+# Номера слоёв Altium -> наши имена. 1..32 -- медь, 33/34 -- шелкография,
+# 35..38 -- паста и маска (их Altium делает сам из площадок, графику оттуда
+# не берём), 57..72 -- механические, из них 13-й обычно сборочный, 15-й --
+# область установки.
+PCB_LAYER = {1: "copper_top", 32: "copper_bot", 33: "silk", 34: "silk_bot",
+             35: "paste", 36: "paste_bot", 37: "mask", 38: "mask_bot",
+             56: "keepout", 69: "assy", 71: "courtyard", 74: "multi"}
+PAD_LAYER = {1: "top", 32: "bottom", 74: "multi"}
+PCB_PAD_SHAPE = {1: "round", 2: "rect", 3: "octagon", 9: "roundrect"}
+
+# Сколько блоков-строк идёт в записи перед телом: у площадки шесть
+# (имя, три служебных, тело, хвост), у строки текста два.
+_PCB_BLOCKS = {2: 6, 5: 2}
+
+
+def _pcb_records(data: bytes):
+    """Записи потока <посадка>/Data: (тип, [блоки])."""
+    if len(data) < 4:
+        return
+    off = 4 + struct.unpack_from("<I", data, 0)[0]
+    while off < len(data):
+        kind = data[off]
+        off += 1
+        blocks = []
+        try:
+            for _ in range(_PCB_BLOCKS.get(kind, 1)):
+                ln = struct.unpack_from("<I", data, off)[0]
+                blocks.append(data[off + 4:off + 4 + ln])
+                off += 4 + ln
+        except struct.error:
+            return
+        yield kind, blocks
+
+
+def _pcb_mm(b: bytes, at: int) -> float:
+    return struct.unpack_from("<i", b, at)[0] / PCB_UNITS_PER_MM
+
+
+def _pcb_footprint(name: str, data: bytes) -> Footprint:
+    """
+    Разобрать одно посадочное место из .PcbLib.
+
+    Раньше из библиотеки бралось только имя: посадку в целевую библиотеку
+    всё равно копирует сам Altium. Но тогда в программе от неё не остаётся
+    ничего -- ни превью, ни габаритов, ни числа площадок, и компонент из
+    архива выглядит так, будто приехал один символ. Геометрию читаем для
+    показа и замеров; в сборку по-прежнему уходит ссылка на исходную
+    библиотеку, так что вендорская посадка не искажается.
+    """
+    fp = Footprint(name=name)
+    for kind, blocks in _pcb_records(data):
+        # У площадки тело -- пятый блок (шестой пустой, служебный),
+        # у остальных примитивов -- первый и единственный.
+        b = (blocks[4] if kind == 2 and len(blocks) > 4
+             else (blocks[0] if blocks else b""))
+        try:
+            if kind == 2 and len(b) >= 61:           # площадка
+                layer = PAD_LAYER.get(b[0], "top")
+                w, h = _pcb_mm(b, 21), _pcb_mm(b, 25)
+                hole = _pcb_mm(b, 45)
+                shape = PCB_PAD_SHAPE.get(b[49], "rect")
+                if shape == "round" and abs(w - h) > 1e-6:
+                    shape = "oval"
+                num = blocks[0]
+                fp.pads.append(Pad(
+                    number=num[1:1 + num[0]].decode("cp1251", "replace")
+                    if num else "",
+                    x=_pcb_mm(b, 13), y=_pcb_mm(b, 17), w=w, h=h,
+                    shape=shape, rot=struct.unpack_from("<d", b, 52)[0],
+                    layer="multi" if hole > 0 else layer, hole=hole,
+                    plated=bool(b[60])))
+            elif kind == 4 and len(b) >= 33:         # линия
+                lay = PCB_LAYER.get(b[0], "mech")
+                if lay in DERIVED_LAYERS:
+                    continue
+                fp.prims.append(FpPrim(
+                    kind="line", layer=lay,
+                    pts=[[_pcb_mm(b, 13), _pcb_mm(b, 17)],
+                         [_pcb_mm(b, 21), _pcb_mm(b, 25)]],
+                    width=_pcb_mm(b, 29)))
+            elif kind == 1 and len(b) >= 45:         # дуга
+                lay = PCB_LAYER.get(b[0], "mech")
+                if lay in DERIVED_LAYERS:
+                    continue
+                fp.prims.append(FpPrim(
+                    kind="arc", layer=lay,
+                    pts=[[_pcb_mm(b, 13), _pcb_mm(b, 17)]],
+                    radius=_pcb_mm(b, 21),
+                    a1=struct.unpack_from("<d", b, 25)[0],
+                    a2=struct.unpack_from("<d", b, 33)[0],
+                    width=_pcb_mm(b, 41)))
+            elif kind == 6 and len(b) >= 29:         # заливка
+                lay = PCB_LAYER.get(b[0], "mech")
+                if lay in DERIVED_LAYERS:
+                    continue
+                fp.prims.append(FpPrim(
+                    kind="rect", layer=lay, filled=True,
+                    pts=[[_pcb_mm(b, 13), _pcb_mm(b, 17)],
+                         [_pcb_mm(b, 21), _pcb_mm(b, 25)]],
+                    width=0.0))
+        except (struct.error, IndexError, UnicodeDecodeError):
+            continue
+    return fp
+
+
+def read_pcblib(path: str) -> Dict[str, Footprint]:
+    """Посадочные места из .PcbLib с геометрией: {имя: Footprint}."""
+    _require_ole()
+    ole = olefile.OleFileIO(path)
+    try:
+        skip = {"FileHeader", "Library", "FileVersionInfo", "Storage"}
+        out: Dict[str, Footprint] = {}
+        for entry in ole.listdir():
+            if len(entry) != 2 or entry[1] != "Data" or entry[0] in skip:
+                continue
+            data = ole.openstream("/".join(entry)).read()
+            out[entry[0]] = _pcb_footprint(entry[0], data)
+        return out
+    finally:
+        ole.close()
+
+
 def pcblib_models(path: str) -> List[str]:
     """Имена 3D-моделей, вшитых в .PcbLib (информационно)."""
     _require_ole()
@@ -251,7 +385,16 @@ def components_from_altium(schlib: str, pcblib: str = "",
     """
     from ..ir import Model3D
     step_files = step_files or {}
-    fp_names = read_pcblib_names(pcblib) if pcblib and os.path.isfile(pcblib) else []
+    geoms: Dict[str, Footprint] = {}
+    if pcblib and os.path.isfile(pcblib):
+        try:
+            geoms = read_pcblib(pcblib)
+        except Exception:
+            # геометрия -- не повод терять компонент: имена читаются
+            # отдельным, более простым путём
+            geoms = {}
+    fp_names = list(geoms) or (read_pcblib_names(pcblib)
+                               if pcblib and os.path.isfile(pcblib) else [])
     out: List[Component] = []
     for name, info in read_schlib(schlib).items():
         c = Component()
@@ -275,7 +418,9 @@ def components_from_altium(schlib: str, pcblib: str = "",
         want = info["footprints"] or fp_names
         for fpn in want:
             if pcblib and (fpn in fp_names or not fp_names):
-                fp = Footprint(name=fpn, source_pcblib=pcblib, source_name=fpn)
+                fp = geoms.get(fpn)
+                fp = copy.deepcopy(fp) if fp is not None else Footprint(name=fpn)
+                fp.source_pcblib, fp.source_name = pcblib, fpn
                 st = step_files.get(fpn) or step_files.get("*")
                 if st:
                     fp.model = Model3D(path=st)
