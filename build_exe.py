@@ -456,11 +456,18 @@ def main() -> int:
         log(f"данные: {src.relative_to(ROOT)} -> {dest}")
 
     # olefile нужен для чтения/записи .PcbLib и .SchLib (формат OLE).
-    if have_module("olefile"):
-        cmd += ["--hidden-import", "olefile"]
-    else:
-        log("ВНИМАНИЕ: нет olefile -- экспорт библиотек Altium не заработает."
-            f"  Поставьте: {sys.executable} -m pip install olefile")
+    # Это не «необязательная возможность»: без него не читаются ни чужие
+    # библиотеки Altium, ни архивы производителей, где лежит .SchLib. И
+    # заметно это станет не сейчас, а через неделю у пользователя, которому
+    # своя сборка скажет «поставьте pip install olefile» -- а у exe pip
+    # нет. Поэтому останавливаем сборку здесь.
+    if not have_module("olefile"):
+        log("ОСТАНОВКА: в этом интерпретаторе нет olefile, а без него")
+        log("собранный exe не прочитает ни .SchLib, ни .PcbLib, ни архивы")
+        log("производителей. Поставьте его ИМЕННО СЮДА и повторите:")
+        log(f"    {sys.executable} -m pip install olefile")
+        return 2
+    cmd += ["--hidden-import", "olefile"]
 
     have_3d = []
     if not args.slim:

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 import struct
+import sys
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -41,9 +42,26 @@ def _useful(name: str, text: str) -> bool:
 
 
 def _require_ole():
-    if olefile is None:
+    """
+    Проверить, что есть чем читать OLE-файл, и подсказать по делу.
+
+    Совет «pip install olefile» бесполезен в двух самых частых случаях:
+    у собранного exe своего pip нет вообще, а из исходников человек ставит
+    пакет не в то окружение, из которого запускает программу. Поэтому
+    говорим, куда именно ставить, и печатаем свой sys.executable.
+    """
+    if olefile is not None:
+        return
+    if getattr(sys, "frozen", False):
         raise RuntimeError(
-            "Не установлен модуль olefile. Выполните: pip install olefile")
+            "в эту сборку не попал модуль olefile, поэтому .SchLib и "
+            ".PcbLib она читать не умеет. Возьмите свежий установщик со "
+            "страницы Releases либо пересоберите exe: сначала "
+            "pip install olefile, затем python build_exe.py")
+    raise RuntimeError(
+        "не установлен модуль olefile. Ставить нужно в то окружение, из "
+        "которого запущена программа:\n    "
+        + sys.executable + " -m pip install olefile")
 
 
 # ----------------------------------------------------------------- записи ----

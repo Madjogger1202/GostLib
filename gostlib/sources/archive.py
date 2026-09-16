@@ -128,7 +128,15 @@ def components(sc: ArchiveScan, log=None) -> List[Component]:
             log(f"{os.path.basename(sl)}: компонентов {len(cs)}"
                 + (f", посадки из {os.path.basename(pl)}" if pl else ""))
             out.extend(cs)
-        return out
+        if out:
+            return out
+        # Архивы производителей (Ultra Librarian, SnapEDA) кладут один и
+        # тот же компонент сразу для десятка САПР. Если библиотека Altium
+        # не прочиталась -- это не повод возвращать пустоту: рядом, в том
+        # же архиве, лежат файлы KiCad, и они читаются всегда.
+        if sc.kicad_syms or sc.kicad_mods or sc.steps:
+            log("Из библиотеки Altium ничего не вышло — беру то же самое "
+                "из файлов KiCad в этом же архиве")
 
     if sc.kicad_syms:
         log(f"В архиве: символов KiCad {len(sc.kicad_syms)}, "

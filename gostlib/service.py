@@ -378,7 +378,17 @@ class Service:
             self.log(f"Тип содержимого: {sc.kind()}")
             comps = archive.components(sc, self.log)
             if not comps:
-                self.log("Ничего пригодного не найдено.")
+                # «Ничего пригодного» -- неправда, когда файлы в архиве
+                # есть, а прочитать их не вышло: причина написана строкой
+                # выше, и надо на неё показать, а не прятать за общей
+                # фразой.
+                had = (len(sc.schlibs) + len(sc.pcblibs) + len(sc.kicad_syms)
+                       + len(sc.kicad_mods) + len(sc.steps))
+                if had:
+                    self.log(f"Файлы в архиве есть ({had} шт.), но ни один не "
+                             f"прочитался — причина строкой выше.")
+                else:
+                    self.log("Ничего пригодного не найдено.")
             return self._absorb(comps)
         finally:
             sc.cleanup()

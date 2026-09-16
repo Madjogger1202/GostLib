@@ -189,7 +189,10 @@ def _footprint_primitives(fp: Footprint) -> List[bytes]:
 def _load_template(template: str = "") -> Dict[str, object]:
     """Взять из шаблона потоки Library/* -- настройки платы и стек слоёв."""
     if olefile is None:
-        raise RuntimeError("нужен модуль olefile: pip install olefile")
+        raise RuntimeError(
+            "нужен модуль olefile — поставьте его в то окружение, из "
+            "которого запущена программа (см. сообщение при чтении "
+            ".SchLib), или возьмите готовый установщик")
     if not template:
         template = os.path.join(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))), "templates", "empty.PcbLib")

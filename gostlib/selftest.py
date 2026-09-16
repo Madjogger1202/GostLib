@@ -1023,6 +1023,58 @@ def check_archive_match(res: Result):
     res.check("пустой запрос не даёт ложного совпадения",
               _score("", "SOIC-8") == 0, "")
 
+    # Архив производителя (Ultra Librarian, SnapEDA) кладёт один и тот же
+    # компонент сразу для десятка САПР. Если библиотека Altium не
+    # прочиталась -- не важно почему: нет olefile, файл битый, -- рядом в
+    # том же архиве лежат файлы KiCad. Импорт обязан взять их, а не
+    # сказать «ничего пригодного не найдено»: ровно так пропадал разъём
+    # FH12-40S-0.5SH из архива Hirose.
+    import tempfile
+    from .sources import archive as ar
+    sym = """(kicad_symbol_lib (version 20211014) (generator test)
+  (symbol "CONN2" (in_bom yes)
+    (property "Reference" "J" (id 0) (at 0 0 0))
+    (property "Footprint" "lib:CONN2" (id 2) (at 0 0 0))
+    (symbol "CONN2_1_1"
+      (pin passive line (at -5.08 0 0) (length 2.54)
+        (name "1" (effects (font (size 1.27 1.27))))
+        (number "1" (effects (font (size 1.27 1.27)))))
+      (pin passive line (at -5.08 -2.54 0) (length 2.54)
+        (name "2" (effects (font (size 1.27 1.27))))
+        (number "2" (effects (font (size 1.27 1.27)))))))
+)"""
+    mod = """(footprint "CONN2" (layer "F.Cu")
+  (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask"))
+  (pad "2" smd rect (at 2 0) (size 1 1) (layers "F.Cu" "F.Mask"))
+)"""
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "Altium"))
+        os.makedirs(os.path.join(td, "KiCad"))
+        with open(os.path.join(td, "Altium", "CONN2.SchLib"), "wb") as f:
+            f.write(b"not an OLE compound file at all")
+        with open(os.path.join(td, "KiCad", "CONN2.kicad_sym"), "w",
+                  encoding="utf-8") as f:
+            f.write(sym)
+        with open(os.path.join(td, "KiCad", "CONN2.kicad_mod"), "w",
+                  encoding="utf-8") as f:
+            f.write(mod)
+        sc = ar.scan_dir(td)
+        notes: List[str] = []
+        comps = ar.components(
+            sc, log=lambda *a: notes.append(" ".join(str(x) for x in a)))
+    res.check("архив с .SchLib определяется как altium",
+              sc.kind() == "altium", sc.kind())
+    res.check("нечитаемая библиотека Altium не отменяет импорт",
+              len(comps) == 1 and comps[0].name == "CONN2"
+              and len(comps[0].symbol.pins) == 2,
+              str([(c.name, len(c.symbol.pins)) for c in comps]))
+    res.check("посадка при этом тоже доехала",
+              comps and comps[0].footprints
+              and len(comps[0].footprints[0].pads) == 2,
+              str([[f.name for f in c.footprints] for c in comps]))
+    res.check("в журнале сказано, что взяли файлы KiCad",
+              any("KiCad" in n for n in notes), " | ".join(notes))
+
 
 def check_backup_and_clear(res: Result):
     """Копия должна собираться, а очистка -- не трогать лишнего."""
