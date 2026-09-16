@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -365,6 +366,85 @@ def report_env(want_3d: bool) -> None:
     log("")
 
 
+# --------------------------------------------------------------- версия ------
+
+# Ресурс версии Windows. Без него свойства exe пустые: в проводнике нет
+# ни версии, ни названия, а установщик и антивирусы смотрят именно сюда.
+# Строка берётся из gostlib/__init__.py -- одного места на весь проект.
+VERSION_TEMPLATE = """# -*- coding: utf-8 -*-
+# Создаётся build_exe.py из gostlib/__init__.py. Править здесь бесполезно.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={nums},
+    prodvers={nums},
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable('041904B0', [
+        StringStruct('CompanyName', 'GostLib'),
+        StringStruct('FileDescription', {descr!r}),
+        StringStruct('FileVersion', {version!r}),
+        StringStruct('InternalName', {name!r}),
+        StringStruct('LegalCopyright', 'MIT License'),
+        StringStruct('OriginalFilename', {filename!r}),
+        StringStruct('ProductName', 'GostLib'),
+        StringStruct('ProductVersion', {version!r})
+      ])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1049, 1200])])
+  ]
+)
+"""
+
+VERSION_DESCR = "GostLib - менеджер библиотеки компонентов для Altium Designer"
+
+
+def read_version() -> str:
+    """
+    Версия из gostlib/__init__.py.
+
+    Читаем текстом, а не импортом: импорт пакета тянет за собой PySide6 и
+    падает в окружении, где его нет, -- а версия нужна раньше всех
+    проверок.
+    """
+    try:
+        text = (PKG / "__init__.py").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    m = re.search(r"""^__version__\s*=\s*['"]([^'"]+)['"]""", text, re.M)
+    return m.group(1) if m else ""
+
+
+def version_nums(version: str) -> tuple:
+    """Версия в виде четвёрки чисел -- так её требует ресурс Windows."""
+    nums = [int(x) for x in re.findall(r"\d+", version or "")[:4]]
+    return tuple(nums + [0] * (4 - len(nums)))
+
+
+def write_version_file(version: str, name: str) -> "Path | None":
+    """Положить ресурс версии рядом с промежуточными файлами сборки."""
+    if not version:
+        return None
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    path = BUILD_DIR / "version_info.txt"
+    text = VERSION_TEMPLATE.format(nums=version_nums(version),
+                                   version=version, name=name,
+                                   filename=f"{name}.exe",
+                                   descr=VERSION_DESCR)
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        log(f"Не удалось записать ресурс версии: {exc}")
+        return None
+    return path
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Сборка GostLib.exe (PyInstaller, один файл)")
@@ -383,7 +463,9 @@ def main() -> int:
                          "остановится, а не соберёт молча урезанный exe")
     args = ap.parse_args()
 
+    version = read_version()
     log("=== Сборка GostLib.exe ===")
+    log(f"Версия: {version or 'НЕ НАЙДЕНА в gostlib/__init__.py'}")
     log(f"Python: {sys.version.split()[0]}  ({sys.executable})")
     log(f"Проект: {ROOT}")
     log("")
@@ -504,6 +586,16 @@ def main() -> int:
     for mod in EXCLUDE_QT:
         cmd += ["--exclude-module", mod]
 
+    # Версия в свойствах файла. Раньше её не было вовсе: собранный exe
+    # выглядел безымянным и одинаковым от сборки к сборке, и понять, какая
+    # версия установлена, можно было только запустив её.
+    vfile = write_version_file(version, args.name)
+    if vfile is not None:
+        cmd += ["--version-file", str(vfile)]
+        log(f"Версия в свойствах exe: {version}")
+    else:
+        log("ВНИМАНИЕ: версия в свойствах exe не будет проставлена.")
+
     if args.clean:
         cmd.append("--clean")
     cmd.append(str(launcher))
@@ -530,6 +622,7 @@ def main() -> int:
     log("")
     if exe.is_file():
         log("Готово.")
+        log(f"Версия: {version}   (она же в свойствах файла)")
         log(f"Файл:   {exe}")
         log(f"Размер: {human_size(exe.stat().st_size)}")
         log("")

@@ -7,7 +7,26 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, Optional
 
 
+# Переменная окружения, которой рабочую папку можно унести куда угодно:
+# на другой диск, в облачную папку отдела, на флешку. Задаётся один раз в
+# «Переменные среды» Windows и действует на все запуски -- и на exe, и на
+# запуск из исходников.
+HOME_ENV = "GOSTLIB_HOME"
+
+
 def default_root() -> str:
+    """
+    Рабочая папка: каталог компонентов, настройки, модели, задания,
+    резервные копии.
+
+    Лежит ОТДЕЛЬНО от программы и специально: обновление или удаление
+    самой программы её не трогает, поэтому библиотека переживает
+    переустановку. По умолчанию это %LOCALAPPDATA%\\GostLib (на Windows)
+    или ~/.gostlib.
+    """
+    own = (os.environ.get(HOME_ENV) or "").strip().strip('"')
+    if own:
+        return os.path.abspath(os.path.expanduser(own))
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
         return os.path.join(base, "GostLib")

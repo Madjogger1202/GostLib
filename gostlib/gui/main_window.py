@@ -404,6 +404,8 @@ class MainWindow(QMainWindow):
         self.refresh_table()
         self._rebuild_cols_menu()
         self.log("GostLib готов. Рабочая папка: " + self.cfg.root)
+        self.log("  Каталог, настройки и резервные копии лежат там, "
+                 "отдельно от программы: обновление их не трогает.")
         self._check_font()
 
     def _check_font(self):

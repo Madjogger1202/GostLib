@@ -12,10 +12,13 @@
 from __future__ import annotations
 
 import glob
+import io
 import os
+import pathlib
 import re
 import shutil
 import tempfile
+import tokenize
 import traceback
 from typing import List, Tuple
 
@@ -1171,6 +1174,86 @@ def check_view_budget(res: Result):
     keep = sorted(view3d._biggest(big, 2))
     res.check("прореживание оставляет крупные грани", keep == [0, 2],
               str(keep))
+
+
+def check_build_version(res: Result):
+    """
+    Версия в собранном exe.
+
+    Повод: свойства собранного файла оставались пустыми, и отличить свежую
+    сборку от прошлогодней можно было только запустив её.
+    """
+    import importlib.util
+    from . import __version__ as ver
+    from . import config
+
+    # Рабочая папка переносится переменной окружения -- это обещано в
+    # документации, поэтому проверяется.
+    old = os.environ.get(config.HOME_ENV)
+    try:
+        os.environ[config.HOME_ENV] = os.path.join("~", "gostlib-selftest")
+        moved = config.default_root()
+    finally:
+        if old is None:
+            os.environ.pop(config.HOME_ENV, None)
+        else:
+            os.environ[config.HOME_ENV] = old
+    res.check("рабочая папка переносится через " + config.HOME_ENV,
+              moved == os.path.abspath(os.path.expanduser(
+                  os.path.join("~", "gostlib-selftest"))), moved)
+    res.check("без переменной рабочая папка на месте",
+              config.default_root().endswith("GostLib")
+              or config.default_root().endswith(".gostlib"),
+              config.default_root())
+
+    script = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "build_exe.py")
+    if not os.path.isfile(script):
+        return                      # exe собран -- скрипта рядом нет
+    spec = importlib.util.spec_from_file_location("_build_exe", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    res.check("сборка берёт версию из пакета", mod.read_version() == ver,
+              f"{mod.read_version()} вместо {ver}")
+    res.check("версия раскладывается в четвёрку чисел",
+              len(mod.version_nums(ver)) == 4
+              and mod.version_nums(ver)[0] >= 1,
+              str(mod.version_nums(ver)))
+
+    with tempfile.TemporaryDirectory() as td:
+        old_dir = mod.BUILD_DIR
+        try:
+            mod.BUILD_DIR = pathlib.Path(td)
+            vf = mod.write_version_file(ver, "GostLib")
+        finally:
+            mod.BUILD_DIR = old_dir
+        res.check("ресурс версии записан", vf is not None and vf.is_file(),
+                  str(vf))
+        if vf is None:
+            return
+        raw = open(vf, "rb").read()
+        enc, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+        text = raw.decode(enc)
+    res.check("в ресурсе стоит текущая версия", text.count(f"'{ver}'") >= 2,
+              ver)
+    # PyInstaller читает этот файл eval-ом. Значит он обязан быть одним
+    # выражением: лишняя строка или запятая -- и сборка падает в конце,
+    # после нескольких минут работы.
+    stub = type("S", (), {"__init__": lambda self, *a, **k: None})
+    names = dict.fromkeys(
+        ("VSVersionInfo", "FixedFileInfo", "StringFileInfo", "StringTable",
+         "StringStruct", "VarFileInfo", "VarStruct"), stub)
+    try:
+        ok = eval(text, dict(names))            # noqa: S307 -- так делает и PyInstaller
+    except Exception as e:
+        ok = None
+        res.check("ресурс версии разбирается так же, как в PyInstaller",
+                  False, str(e))
+    if ok is not None:
+        res.check("ресурс версии разбирается так же, как в PyInstaller",
+                  isinstance(ok, stub), type(ok).__name__)
+    res.check("в ресурсе указан язык и кодовая страница",
+              "'041904B0'" in text and "[1049, 1200]" in text, "")
 
 
 def check_mesh_size(res: Result):
@@ -2806,6 +2889,7 @@ def run(st=None) -> Result:
     res.run("бюджет 3D-модели", lambda: check_model_budget(res))
     res.run("крупные 3D-модели", lambda: check_heavy_models(res))
     res.run("бюджет просмотра 3D", lambda: check_view_budget(res))
+    res.run("версия в сборке", lambda: check_build_version(res))
     res.run("посадка 3D на плату", lambda: check_model_seating(res))
     res.run("цвет модели держится",
             lambda: check_model_color_sticks(res))
