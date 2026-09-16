@@ -165,6 +165,8 @@ def check_slots(res: Result):
        (drill oval 2.6 1.2) (layers *.Cu *.Mask))
   (pad "H" thru_hole circle (at 10 0) (size 2 2)
        (drill 1.0) (layers *.Cu *.Mask))
+  (pad "SH" thru_hole oval (at 15 0 90) (size 2.0 0.9)
+       (drill oval 1.7 0.6) (layers *.Cu *.Mask))
 )"""
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "mp.kicad_mod")
@@ -196,6 +198,21 @@ def check_slots(res: Result):
     res.check("угол паза уходит в задание",
               int(got["MP"][12]) == 900 and int(got["MP2"][12]) == 0,
               f"{got['MP'][12]} / {got['MP2'][12]}")
+    # Крепёжная площадка USB-шилда: в KiCad она сама повёрнута на 90, а
+    # паз идёт вдоль неё. Хранится угол абсолютный (90), а в Altium
+    # отверстие крутится ВМЕСТЕ с площадкой -- значит в задание уходит
+    # угол от площадки, то есть 0. Раньше уходило 90, и паз ложился
+    # поперёк крепления.
+    sh = by["SH"]
+    res.check("повёрнутая площадка: угол паза абсолютный",
+              abs(sh.rot + 90.0) < 1e-6 and abs(sh.hole_rot - 90.0) < 1e-6,
+              f"rot {sh.rot}, паз {sh.hole_rot}")
+    res.check("в задание угол паза идёт от площадки",
+              int(got["SH"][12]) == 0 and abs(aj.slot_angle(sh)) < 1e-6,
+              f"{got['SH'][12]} / {aj.slot_angle(sh)}")
+    res.check("неповёрнутую площадку это не трогает",
+              abs(aj.slot_angle(by["MP"]) - 90.0) < 1e-6,
+              str(aj.slot_angle(by["MP"])))
     from .emit import jobcheck
     res.check("задание с пазами без замечаний", not jobcheck.check(txt),
               "; ".join(jobcheck.check(txt)[:2]))

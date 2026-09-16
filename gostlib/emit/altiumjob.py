@@ -110,6 +110,25 @@ def deg10(v: float) -> int:
     return int(round(float(v) * 10.0))
 
 
+def slot_angle(p: Pad) -> float:
+    """
+    Угол паза для Altium -- ОТ ПЛОЩАДКИ, а не от платы.
+
+    Altium поворачивает отверстие вместе с площадкой: HoleRotation
+    складывается с Pad.Rotation. У нас угол паза хранится абсолютным (в
+    таком виде его отдаёт EasyEDA полем holePoints), поэтому перед
+    записью поворот площадки вычитается.
+
+    Пока площадка не повёрнута, это одно и то же -- и ровно поэтому
+    разъёмы из EasyEDA приезжали верно (там у крепёжных площадок
+    rot = 0), а из KiCad нет: у USB-шилда площадка стоит под 90
+    градусов, и паз уезжал поперёк неё вместе с ней.
+    """
+    rot = p.slot_rot() if hasattr(p, "slot_rot") \
+        else float(getattr(p, "hole_rot", 0.0) or 0.0)
+    return (float(rot) - float(getattr(p, "rot", 0.0) or 0.0)) % 180.0
+
+
 def _rot4(v: float) -> int:
     r = int(round(float(v))) % 360
     return {0: 0, 90: 90, 180: 180, 270: 270}.get(r, 0)
@@ -305,8 +324,7 @@ def _emit_footprint(j: _Job, fp: Footprint):
         j.add("PAD", esc(p.number), mm(p.x), mm(p.y), mm(p.w), mm(p.h),
               PAD_SHAPE.get(p.shape, 2), deg10(p.rot), layer, mm(p.hole),
               1 if p.plated else 0, mm(p.hole_len),
-              deg10(p.slot_rot() if hasattr(p, "slot_rot")
-                    else getattr(p, "hole_rot", 0.0)),
+              deg10(slot_angle(p)),
               _exp(getattr(p, "mask_expansion", None),
                    getattr(fp, "mask_expansion", None)),
               paste_exp)
