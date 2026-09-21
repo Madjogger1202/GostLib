@@ -280,7 +280,7 @@ class BuildDialog(QDialog):
             for item in res["heavy3d"].split(";")[:5]:
                 nm, _, mb = item.rpartition(":")
                 info.append(f"  {nm}: {mb} МБ")
-            info.append("  «Запасные пути → Пережать 3D-модели» ускорит "
+            info.append("  «Настройки → Сервис → Пережать 3D-модели» ускорит "
                         "сборку в разы")
         if res.get("problems"):
             info += ["", "Замечания по заданию:"] + [
@@ -499,15 +499,8 @@ class MainWindow(QMainWindow):
         self.b_pick.clicked.connect(self.do_pick_from_catalog)
         tb.addWidget(self.b_pick)
 
-        self.cb_imp_proj = QCheckBox("импорт → в проект")
-        self.cb_imp_proj.setToolTip(
-            "Всё импортированное сразу входит в текущий проект.\n"
-            "Иначе компонент осядет только в общем каталоге, и при показе "
-            "состава проекта его не будет видно.")
-        self.cb_imp_proj.setChecked(
-            bool(getattr(self.cfg, "import_to_project", True)))
-        self.cb_imp_proj.stateChanged.connect(self._set_import_to_project)
-        tb.addWidget(self.cb_imp_proj)
+        # «Импорт -> в проект» -- настройка, а не кнопка: её выставляют один
+        # раз. Живёт в «Настройки -> Работа».
         tb.addSeparator()
 
         # Общая библиотека на отдел живёт не в SQLite, а в текстовой папке,
@@ -565,13 +558,20 @@ class MainWindow(QMainWindow):
             "в строке состояния: состав текущего проекта либо общая "
             "библиотека. Выделение в таблице ни на что не влияет.\n"
             "Altium построит библиотеки своим API по кнопке GostLib.  F9")
-        self.b_build.setShortcut(QKeySequence("F9"))
         self.b_build.clicked.connect(lambda: self.do_convert("script"))
+        # F9 -- действием окна, а не кнопки: у спрятанной кнопки клавиша
+        # не срабатывает, а спрятана она по умолчанию.
+        self.act_job = QAction("Собрать задание", self)
+        self.act_job.setShortcut(QKeySequence("F9"))
+        self.act_job.triggered.connect(lambda: self.do_convert("script"))
+        self.addAction(self.act_job)
         self.b_build.setStyleSheet(
             "QPushButton{background:#3a4a63;border:1px solid #4d6180;"
             "padding:6px 14px;font-weight:bold;}"
             "QPushButton:hover{background:#46587a;}")
-        tb.addWidget(self.b_build)
+        self._act_build = tb.addWidget(self.b_build)
+        self._act_build.setVisible(
+            bool(getattr(self.cfg, "show_job_button", False)))
 
         self.b_run = QPushButton("▶  Собрать и запустить")
         self.b_run.setToolTip(
@@ -587,32 +587,8 @@ class MainWindow(QMainWindow):
             "QPushButton:hover{background:#379a54;}")
         tb.addWidget(self.b_run)
 
-        # запасные пути -- под одной кнопкой, чтобы не мозолили глаза
-        alt = QPushButton("Запасные пути ▾")
-        altm = QMenu(self)
-        altm.addAction("Через KiCad-импортёр (Import Wizard)",
-                       lambda: self.do_convert("kicad"))
-        altm.addAction("Через EAGLE (.lbr)", lambda: self.do_convert("eagle"))
-        altm.addAction("Прямая двоичная запись .SchLib/.PcbLib",
-                       lambda: self.do_convert("binary"))
-        altm.addSeparator()
-        altm.addAction("Открыть папку библиотеки",
-                       lambda: self._open(self.cfg.lib_dir))
-        altm.addAction("Показать журнал скрипта Altium", self.show_script_log)
-        altm.addAction("Команда запуска скрипта…", self.do_show_command)
-        altm.addSeparator()
-        altm.addAction("Резервная копия…", self.do_backup)
-        altm.addAction("Очистить библиотеку…", self.do_clear_library)
-        altm.addAction("Открыть папку резервных копий",
-                       lambda: self._open(self.svc.backup_dir()))
-        altm.addSeparator()
-        altm.addAction("Доставить пакеты для просмотра 3D телом",
-                       self.do_setup3d)
-        altm.addAction("Пережать 3D-модели (ускорить сборку)…",
-                       self.do_shrink_models)
-        altm.addAction("Посадить 3D-модели на плату…", self.do_reseat_models)
-        alt.setMenu(altm)
-        tb.addWidget(alt)
+        # Запасные пути и служебные действия -- в «Настройки -> Сервис»:
+        # ими пользуются раз в месяц, а место на панели они занимали всегда.
         tb.addSeparator()
         act("Удалить", self.do_delete, "Удалить выбранное из каталога", "Del")
         act("Настройки", self.do_settings)
@@ -768,7 +744,7 @@ class MainWindow(QMainWindow):
         cv.addWidget(self.table, 1)
 
         # ---- правая панель
-        self.sym_view = PreviewPane("схемный символ", bg="#ffffff")
+        self.sym_view = PreviewPane("символ", bg="#ffffff")
         self.fp_view = PreviewPane("посадочное место", bg="#101018")
 
         # ---- карточка посадочного места: габариты и 3D
@@ -1092,10 +1068,6 @@ class MainWindow(QMainWindow):
         self.cb_src.currentIndexChanged.connect(self._set_symbol_source)
         symrow.addWidget(self.cb_src)
 
-        self.b_own_reset = QPushButton("Сбросить личные")
-        self.b_own_reset.setToolTip("Вернуть компонент к общим настройкам")
-        self.b_own_reset.clicked.connect(self._reset_comp_style)
-        symrow.addWidget(self.b_own_reset)
 
         # Секция для превью. Держим переключатель ОТДЕЛЬНОЙ строкой: после
         # добавления личных настроек первая строка стала шире панели и этот
@@ -1148,10 +1120,36 @@ class MainWindow(QMainWindow):
         self.rules_edit = QPlainTextEdit()
         self.rules_edit.setFont(QFont("Consolas", 10))
         self.rules_edit.setPlaceholderText(
-            "имя группы | сторона | шаблоны через запятую\n"
+            "имя группы | сторона | шаблоны через запятую  [+пара] [+низ]\n"
             "Питание | L | VDD*, VCC*, AVDD\n"
-            "USB     | R | USB_D*, D+, D-   +пара")
-        rv.addWidget(self.rules_edit, 1)
+            "USB     | R | USB_D*, D+, D-   +пара\n"
+            "Порт A  | A | PA[0-9]*")
+        rsplit = QSplitter(Qt.Vertical)
+        rsplit.addWidget(self.rules_edit)
+        # Проверка правил на выбранном компоненте -- до применения: видно,
+        # какой вывод в какую группу попал и что осталось автоматике.
+        # Раньше это выяснялось только пересборкой и разглядыванием УГО.
+        chk = QWidget()
+        cv = QVBoxLayout(chk)
+        cv.setContentsMargins(0, 0, 0, 0)
+        crow = QHBoxLayout()
+        b_check = QPushButton("Проверить на этом компоненте")
+        b_check.setToolTip("Разложить выводы выбранного компонента по "
+                           "тексту выше, ничего не сохраняя")
+        b_check.clicked.connect(self._check_rules)
+        crow.addWidget(b_check)
+        self.rules_stat = QLabel("")
+        self.rules_stat.setStyleSheet("color:#8a93a6;")
+        crow.addWidget(self.rules_stat, 1)
+        cv.addLayout(crow)
+        self.rules_view = QPlainTextEdit()
+        self.rules_view.setReadOnly(True)
+        self.rules_view.setFont(QFont("Consolas", 9))
+        cv.addWidget(self.rules_view, 1)
+        rsplit.addWidget(chk)
+        rsplit.setStretchFactor(0, 3)
+        rsplit.setStretchFactor(1, 2)
+        rv.addWidget(rsplit, 1)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(symw, "УГО")
@@ -1454,7 +1452,6 @@ class MainWindow(QMainWindow):
                                                  st.compact_symbols)))
         for w in (self.cb_nums, self.cb_compact, self.sp_scale):
             w.blockSignals(False)
-        self.b_own_reset.setEnabled(bool(over))
         src = getattr(c, "symbol_source", "gost")
         self.cb_src.blockSignals(True)
         self.cb_src.setCurrentIndex(1 if src == "native" else 0)
@@ -1727,9 +1724,154 @@ class MainWindow(QMainWindow):
         self.refresh_projects()
         self.refresh_table()
 
-    def _set_import_to_project(self):
-        self.cfg.import_to_project = bool(self.cb_imp_proj.isChecked())
-        self.cfg.save()
+    # ------------------------------------------------ выгрузка наружу ------
+    def do_export_kicad_project(self):
+        """Дописать выделенные компоненты в библиотеки проекта KiCad."""
+        uids = self.selected_uids()
+        if not uids:
+            return
+        # Компонент, пришедший из KiCad, проще подключить из исходной
+        # библиотеки. Предупреждаем и называем, откуда он: символ, посадку
+        # и модель. Отключается в «Настройки -> Экспорт в KiCad».
+        if getattr(self.cfg, "kicad_export_warn", True):
+            orig = self.svc.kicad_origins(uids)
+            if orig:
+                lines = []
+                for name, o in orig[:8]:
+                    lines.append(f"• {name}\n"
+                                 f"    символ: {o.get('symbol') or '—'}\n"
+                                 f"    посадка: {o.get('footprint') or '—'}\n"
+                                 f"    3D: {os.path.basename(o.get('model') or '') or '—'}")
+                if len(orig) > 8:
+                    lines.append(f"… и ещё {len(orig) - 8}")
+                box = QMessageBox(self)
+                box.setWindowTitle("Экспорт в проект KiCad")
+                box.setIcon(QMessageBox.Information)
+                box.setText(
+                    ("Этот компонент и так из KiCad." if len(orig) == 1 else
+                     f"{len(orig)} из выделенных и так из KiCad.") +
+                    " Его можно взять из штатной библиотеки KiCad — "
+                    "выгружать копию не обязательно.")
+                box.setInformativeText("\n".join(lines))
+                box.setDetailedText(
+                    "В проект уйдёт символ, собранный в GostLib (по ГОСТ или "
+                    "родной — как выбрано у компонента), а не исходный "
+                    "символ KiCad. Если нужен именно исходный — подключите "
+                    "библиотеку KiCad, названную выше.")
+                go = box.addButton("Всё равно экспортировать",
+                                   QMessageBox.AcceptRole)
+                box.addButton("Отмена", QMessageBox.RejectRole)
+                never = QCheckBox("больше не предупреждать")
+                box.setCheckBox(never)
+                box.exec()
+                if never.isChecked():
+                    self.cfg.kicad_export_warn = False
+                    self.cfg.save()
+                if box.clickedButton() is not go:
+                    return
+        from .dialogs import KicadExportDialog
+        names = [c.name for c in self.svc.collect(uids)]
+        dlg = KicadExportDialog(self.cfg, names, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        v = dlg.values()
+        try:
+            res = self.svc.export_kicad_project(uids, **v)
+        except Exception as e:
+            QMessageBox.critical(self, "GostLib",
+                                 f"Экспорт в KiCad не удался:\n{e}")
+            self.log(traceback.format_exc())
+            return
+        added, replaced = res.get("added") or [], res.get("replaced") or []
+        msg = [f"Библиотека: {res.get('lib')}",
+               f"Символов добавлено: {len(added)}, заменено: {len(replaced)}",
+               f"Посадок: {len(res.get('footprints') or [])}, "
+               f"3D-моделей: {len(res.get('models') or [])}"]
+        for kind, st in (res.get("tables") or {}).items():
+            what = "символов" if kind == "sym" else "посадок"
+            if st == "added":
+                msg.append(f"Библиотека {what} подключена к проекту.")
+            elif str(st).startswith("conflict:"):
+                msg.append(f"В таблице {what} уже есть библиотека с этим "
+                           f"именем, но с другим путём ({str(st)[9:]}) — "
+                           f"таблицу не трогал.")
+        msg.append("Если KiCad открыт — переоткройте проект.")
+        QMessageBox.information(self, "Экспорт в проект KiCad",
+                                "\n".join(msg))
+
+    def do_save_model(self):
+        """Сохранить 3D-модель выделенного компонента (или нескольких)."""
+        from PySide6.QtWidgets import QFileDialog
+        uids = self.selected_uids()
+        models = self.svc.component_models(uids)
+        if not models:
+            QMessageBox.information(self, "GostLib",
+                                    "У выделенного нет 3D-модели на диске.")
+            return
+        if len(models) == 1:
+            name, path = models[0]
+            ext = os.path.splitext(path)[1] or ".step"
+            target, _ = QFileDialog.getSaveFileName(
+                self, f"3D-модель: {name}",
+                os.path.join(os.path.expanduser("~"),
+                             os.path.basename(path)),
+                f"3D-модель (*{ext});;Все файлы (*)")
+        else:
+            target = QFileDialog.getExistingDirectory(
+                self, f"Куда сохранить {len(models)} 3D-моделей",
+                os.path.expanduser("~"))
+        if not target:
+            return
+        try:
+            done = self.svc.save_models(uids, target)
+        except Exception as e:
+            QMessageBox.critical(self, "GostLib", f"Не сохранилось:\n{e}")
+            return
+        self.log(f"Сохранено 3D-моделей: {len(done)}")
+
+    def service_actions(self):
+        """
+        Служебные действия для вкладки «Сервис» в настройках.
+
+        Список -- здесь, рядом с функциями, которые он вызывает: окно
+        настроек ничего не знает про главное окно и просто показывает
+        кнопки.
+        """
+        return [
+            ("Запасные пути сборки", [
+                ("Через KiCad-импортёр (Import Wizard)",
+                 lambda: self.do_convert("kicad"),
+                 "Если скрипт в этом Altium не работает"),
+                ("Через EAGLE (.lbr)", lambda: self.do_convert("eagle"), ""),
+                ("Прямая двоичная запись .SchLib/.PcbLib",
+                 lambda: self.do_convert("binary"),
+                 "Без Altium; годится для простых компонентов"),
+                ("Собрать задание без запуска (F9)",
+                 lambda: self.do_convert("script"), ""),
+            ]),
+            ("Altium", [
+                ("Открыть папку библиотеки",
+                 lambda: self._open(self.cfg.lib_dir), ""),
+                ("Показать журнал скрипта Altium", self.show_script_log, ""),
+                ("Команда запуска скрипта…", self.do_show_command, ""),
+            ]),
+            ("Данные", [
+                ("Резервная копия…", self.do_backup,
+                 "Каталог, настройки, библиотеки, модели и задания — в .zip"),
+                ("Открыть папку резервных копий",
+                 lambda: self._open(self.svc.backup_dir()), ""),
+                ("Открыть рабочую папку",
+                 lambda: self._open(self.cfg.root), ""),
+                ("Очистить библиотеку…", self.do_clear_library, ""),
+            ]),
+            ("3D-модели", [
+                ("Доставить пакеты для просмотра 3D телом",
+                 self.do_setup3d, ""),
+                ("Пережать 3D-модели (ускорить сборку)…",
+                 self.do_shrink_models, ""),
+                ("Посадить 3D-модели на плату…", self.do_reseat_models, ""),
+            ]),
+        ]
 
     def do_pick_from_catalog(self):
         """Добрать в текущий проект то, что уже есть в общем каталоге."""
@@ -1909,10 +2051,12 @@ class MainWindow(QMainWindow):
             self.rules_note.setText(f"правила этого компонента ({c.name})")
         else:
             from ..gost import pingroups
-            self.rules_edit.setPlainText(
-                (getattr(self.cfg, "pin_rules", "") or "").strip()
-                or pingroups.DEFAULT_RULES)
+            # прежние встроенные правила, сохранённые как есть, считаются
+            # встроенными -- показываем нынешние
+            self.rules_edit.setPlainText(pingroups.effective_text(
+                getattr(self.cfg, "pin_rules", "") or ""))
             self.rules_note.setText("общие правила для всей библиотеки")
+        self._check_rules()
 
     def _toggle_own_rules(self):
         c = self.current
@@ -1955,6 +2099,44 @@ class MainWindow(QMainWindow):
     def _default_rules(self):
         from ..gost import pingroups
         self.rules_edit.setPlainText(pingroups.DEFAULT_RULES)
+        self._check_rules()
+
+    def _check_rules(self):
+        """Показать, как текущий текст правил разложит выводы компонента."""
+        from ..gost import pingroups
+        view = getattr(self, "rules_view", None)
+        if view is None:
+            return
+        c = self.current
+        if not c:
+            view.setPlainText("")
+            self.rules_stat.setText("выберите компонент")
+            return
+        text = self.rules_edit.toPlainText()
+        problems = pingroups.check(text)
+        pins = list(c.raw_pins or c.symbol.pins)
+        groups, rest = pingroups.explain(pins, pingroups.parse(text))
+        side_name = {"L": "слева", "R": "справа", "A": "сам",
+                     "T": "слева", "B": "справа"}
+        lines = []
+        for name, side, items in groups:
+            shown = ", ".join(items[:24]) + (" …" if len(items) > 24 else "")
+            lines.append(f"{name} ({side_name.get(side, side)}, "
+                         f"{len(items)}): {shown}")
+        if rest:
+            lines.append("")
+            lines.append(f"Не попали ни под одно правило ({len(rest)}) — их "
+                         f"разложит автоматика по типу вывода:")
+            lines.append(", ".join(sorted(set(rest))))
+        if problems:
+            lines.insert(0, "Замечания: " + "; ".join(problems[:4]))
+            lines.insert(1, "")
+        view.setPlainText("\n".join(lines))
+        n = len(pins)
+        hit = n - len(rest)
+        self.rules_stat.setText(
+            f"{c.name}: под правила попало {hit} из {n}"
+            + (f" ({100 * hit // n}%)" if n else ""))
 
     def _rebuild_all_rules(self):
         """Правила общие — значит перерисовать надо все микросхемы."""
@@ -2944,12 +3126,21 @@ class MainWindow(QMainWindow):
             self.log(str(e))
 
     def do_settings(self):
-        dlg = SettingsDialog(self.cfg, self)
+        dlg = SettingsDialog(self.cfg, self, tools=self.service_actions())
         if dlg.exec():
             self.cfg = dlg.apply()
             self.svc.cfg = self.cfg
-            self.log("Настройки сохранены. Пересоберите символы (F5), "
-                     "чтобы применить стиль.")
+            act = getattr(self, "_act_build", None)
+            if act is not None:
+                act.setVisible(bool(getattr(self.cfg, "show_job_button",
+                                            False)))
+            if dlg.chosen is not None:
+                # служебное действие из вкладки «Сервис»: окно настроек уже
+                # закрыто, и действие может открывать свои окна
+                dlg.chosen()
+            else:
+                self.log("Настройки сохранены. Пересоберите символы (F5), "
+                         "чтобы применить стиль.")
 
     def _type_box_changed(self):
         if not self.current:
@@ -3340,6 +3531,9 @@ class MainWindow(QMainWindow):
         cm.addAction("Через EAGLE (.lbr)", lambda: self.do_convert("eagle"))
         cm.addAction("Прямая запись .SchLib/.PcbLib",
                      lambda: self.do_convert("binary"))
+        m.addSeparator()
+        m.addAction("Экспорт в проект KiCad…", self.do_export_kicad_project)
+        m.addAction("Сохранить 3D-модель…", self.do_save_model)
         m.addSeparator()
         pm = m.addMenu("Проект")
         pm.addAction("Добавить в текущий проект", self._proj_add_sel)

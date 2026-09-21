@@ -21,7 +21,8 @@ from typing import List, Optional, Sequence, Tuple
 from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox,
-                               QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+                               QDoubleSpinBox, QHBoxLayout, QLabel,
+                               QPushButton, QSizePolicy,
                                QVBoxLayout, QWidget)
 
 Point = Tuple[float, float, float]
@@ -530,25 +531,40 @@ class Model3DPane(QWidget):
             bar.addWidget(b)
 
         # --- правка положения модели
+        # Поля, а не кнопки «+0,1»: сдвиг на 3,2 мм кнопками -- это
+        # тридцать два нажатия. В поле число вводится сразу, а стрелки и
+        # колесо мыши по-прежнему шагают понемногу.
         ops = QHBoxLayout()
-        ops.addWidget(QLabel("поворот:"))
-        for txt, kw in (("X +90", ("rx", 90)), ("Y +90", ("ry", 90)),
-                        ("Z +90", ("rz", 90)), ("Z −90", ("rz", -90))):
-            b = QPushButton(txt)
-            b.setFixedHeight(22)
-            b.setMaximumWidth(64)
-            b.clicked.connect(lambda _=False, k=kw: self._bump(k[0], k[1]))
-            ops.addWidget(b)
+        ops.addWidget(QLabel("поворот, °:"))
+        self.spins = {}
+        for key in ("rx", "ry", "rz"):
+            sp = QDoubleSpinBox()
+            sp.setRange(-360.0, 360.0)
+            sp.setDecimals(1)
+            sp.setSingleStep(90.0)
+            sp.setWrapping(True)
+            sp.setPrefix(key[1].upper() + " ")
+            sp.setKeyboardTracking(False)
+            sp.setMaximumWidth(92)
+            sp.setToolTip("Шаг стрелками — 90°. Можно вписать любой угол.")
+            sp.valueChanged.connect(self._spin_changed)
+            self.spins[key] = sp
+            ops.addWidget(sp)
         ops.addSpacing(10)
         ops.addWidget(QLabel("сдвиг, мм:"))
-        for txt, kw in (("X−", ("dx", -0.1)), ("X+", ("dx", 0.1)),
-                        ("Y−", ("dy", -0.1)), ("Y+", ("dy", 0.1)),
-                        ("Z−", ("dz", -0.1)), ("Z+", ("dz", 0.1))):
-            b = QPushButton(txt)
-            b.setFixedHeight(22)
-            b.setMaximumWidth(40)
-            b.clicked.connect(lambda _=False, k=kw: self._bump(k[0], k[1]))
-            ops.addWidget(b)
+        for key in ("dx", "dy", "dz"):
+            sp = QDoubleSpinBox()
+            sp.setRange(-200.0, 200.0)
+            sp.setDecimals(3)
+            sp.setSingleStep(0.05)
+            sp.setPrefix(key[1].upper() + " ")
+            sp.setKeyboardTracking(False)
+            sp.setMaximumWidth(104)
+            sp.setToolTip("Впишите число или крутите колесом: шаг 0,05 мм.\n"
+                          "Z — высота над платой (standoff).")
+            sp.valueChanged.connect(self._spin_changed)
+            self.spins[key] = sp
+            ops.addWidget(sp)
         b = QPushButton("сбросить")
         b.setFixedHeight(22)
         b.clicked.connect(self._reset_tr)
@@ -595,16 +611,35 @@ class Model3DPane(QWidget):
             t[key] = (t[key] + delta) % 360.0
         else:
             t[key] = round(t[key] + delta, 3)
+        self._sync_spins()
+        self.scene.update()
+        self.transform_changed.emit(dict(t))
+
+    def _sync_spins(self):
+        """Показать в полях то, что сейчас стоит у модели."""
+        for key, sp in getattr(self, "spins", {}).items():
+            sp.blockSignals(True)
+            sp.setValue(float(self.scene.tr.get(key, 0.0) or 0.0))
+            sp.blockSignals(False)
+
+    def _spin_changed(self, _value=None):
+        t = self.scene.tr
+        for key, sp in self.spins.items():
+            v = float(sp.value())
+            t[key] = (v % 360.0) if key.startswith("r") else round(v, 3)
+        self.scene._cache_key = None
         self.scene.update()
         self.transform_changed.emit(dict(t))
 
     def _reset_tr(self):
         self.scene.tr = dict(dx=0.0, dy=0.0, dz=0.0, rx=0.0, ry=0.0, rz=0.0)
+        self._sync_spins()
         self.scene.update()
         self.transform_changed.emit(dict(self.scene.tr))
 
     def set_model(self, model=None, fp=None, subtitle: str = ""):
         self.scene.set_model(model, fp)
+        self._sync_spins()
         self.title.setText(subtitle or "3D-модель")
         value = ""
         if fp is not None and getattr(fp, "model", None) is not None:

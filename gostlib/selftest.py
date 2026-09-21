@@ -927,6 +927,111 @@ def check_projects(res: Result):
                   svc.db.stats()["total"] == 3, str(svc.db.stats()))
 
 
+def check_default_pin_rules(res: Result, st):
+    """
+    Встроенные правила выводов на типовых микросхемах.
+
+    Прежние правила покрывали около трети выводов живого каталога --
+    остальное доставалось автоматике по типу вывода. Новые рассчитаны на
+    микроконтроллеры и типовую обвязку; проверяем на характерных наборах
+    имён.
+    """
+    from .gost import pingroups as pg
+    rules = pg.parse(pg.DEFAULT_RULES)
+    res.check("правила выводов: встроенный текст без замечаний",
+              not pg.check(pg.DEFAULT_RULES), str(pg.check(pg.DEFAULT_RULES)))
+
+    def group(name):
+        g, _rest = pg.explain([SymPin(name=name)], rules)
+        return g[0][0] if g else ""
+
+    cases = {
+        # микроконтроллеры
+        "PA9/USART1_TX": "Порт A / 0", "PB12": "Порт B / 1",
+        "P0.13": "Порт A / 0", "RC5": "Порт C / 2", "GPIO21": "GPIO",
+        "IO4": "GPIO", "NRST": "Сброс", "~{RESET}": "Сброс",
+        "MCLR": "Сброс", "RUN": "Сброс", "EN": "Сброс",
+        "BOOT0": "Режим", "PH0-OSC_IN": "Тактирование",
+        "OSC32_IN": "Тактирование", "XIN": "Тактирование",
+        "SWDIO": "Отладка", "SWCLK": "Отладка", "UPDI": "Отладка",
+        # питание и земля, в том числе «хвостатые» имена
+        "VDDA": "Питание", "ADC_AVDD": "Питание", "USB_VDD": "Питание",
+        "VBAT": "Питание", "VSSA": "Земля", "EPAD": "Земля",
+        "AGND": "Земля", "VREF+": "Опорное",
+        # интерфейсы
+        "USB_DP": "USB", "D-": "USB", "CC1": "USB", "VBUS": "USB",
+        "SDA": "I2C", "SCL": "I2C", "MOSI": "SPI", "SCK": "SPI",
+        "CS#": "SPI", "TXD": "UART", "RTS": "UART", "CANH": "CAN / LIN",
+        "TXP": "Ethernet", "MDIO": "Ethernet", "SD_CMD": "SD / SDIO",
+        "QSPI_SS": "QSPI / флеш", "LRCK": "I2S / аудио",
+        "ADC_IN0": "АЦП / ЦАП", "INT": "Состояние", "PGOOD": "Состояние",
+        # аналог и преобразователи
+        "IN+": "Входы", "FB": "Входы", "VOUT": "Выходы", "SW": "Выходы",
+        # память
+        "A12": "Адрес", "DQ7": "Данные", "CKE": "Управление ОЗУ",
+        "NC": "Не подключены", "N/C": "Не подключены",
+    }
+    bad = [f"{n}->{group(n) or '—'} (ждали {g})"
+           for n, g in cases.items() if group(n) != g]
+    res.check("правила выводов: типовые имена попадают в свои группы",
+              not bad, "; ".join(bad[:10]))
+
+    # STM32F103C8 (LQFP-48) целиком: под правила обязан попасть каждый вывод
+    stm = (["VBAT", "PC13", "PC14", "PC15", "PD0", "PD1", "NRST", "VSSA",
+            "VDDA", "BOOT0", "VSS", "VDD", "VSS", "VDD", "VSS", "VDD"]
+           + [f"PA{i}" for i in range(16)] + [f"PB{i}" for i in range(16)
+                                               if i != 2] + ["PB2"])
+    g, rest = pg.explain([SymPin(name=n) for n in stm], rules)
+    res.check("правила выводов: STM32F103C8 — все выводы по правилам",
+              not rest, str(rest))
+    ga = dict((name, items) for name, _s, items in g)
+    res.check("правила выводов: внутри порта по номерам (PA2 раньше PA10)",
+              ga.get("Порт A / 0", [])[:4] == ["PA0", "PA1", "PA2", "PA3"]
+              and ga["Порт A / 0"].index("PA2") < ga["Порт A / 0"].index("PA10"),
+              str(ga.get("Порт A / 0", [])[:12]))
+
+    # Символ целиком: земля внизу слева, порты делятся между сторонами
+    c = _mk("STM32F103C8", "mcu",
+            [(str(i + 1), n, "power" if n.startswith(("V", "GND")) else "io")
+             for i, n in enumerate(stm)])
+    c.symbol.pins = list(c.raw_pins)
+    symbolgen.build(c, st.with_rules(c, ""))
+    left = sorted([p for p in c.symbol.pins if p.rotation == 180],
+                  key=lambda p: -p.y)
+    right = [p for p in c.symbol.pins if p.rotation == 0]
+    res.check("правила выводов: земля прижата к низу левой стороны",
+              left and left[-1].name in ("VSS", "VSSA"),
+              str([p.name for p in left[-4:]]))
+    res.check("правила выводов: порты разнесены на обе стороны",
+              abs(len(left) - len(right)) <= 8,
+              f"слева {len(left)}, справа {len(right)}")
+    res.check("правила выводов: ни один вывод не потерян",
+              len(left) + len(right) == len(stm),
+              f"{len(left) + len(right)} из {len(stm)}")
+
+    # сохранённые в настройки прежние встроенные правила -- это «встроенные»
+    old = pg._LEGACY_DEFAULTS[0]
+    res.check("правила выводов: прежние встроенные заменяются новыми",
+              pg.is_legacy_default(old)
+              and len(pg.rules_for(Component(), old)) == len(rules)
+              and pg.effective_text(old) == pg.DEFAULT_RULES, "")
+    mine = "Моё | R | FOO*"
+    res.check("правила выводов: свои общие правила не подменяются",
+              not pg.is_legacy_default(mine)
+              and [r.name for r in pg.rules_for(Component(), mine)] == ["Моё"],
+              "")
+
+    # T и B раньше выкидывали вывод из символа
+    t = _mk("TB", "ic", [("1", "AAA", "io"), ("2", "BBB", "io"),
+                         ("3", "CCC", "io")])
+    t.pin_rules = "Верх | T | AAA\nНиз | B | BBB"
+    t.symbol.pins = list(t.raw_pins)
+    symbolgen.build(t, st.with_rules(t, ""))
+    res.check("правила выводов: сторона T/B не теряет вывод",
+              sorted(p.name for p in t.symbol.pins) == ["AAA", "BBB", "CCC"],
+              str([p.name for p in t.symbol.pins]))
+
+
 def check_pin_rules(res: Result):
     """Правила группировки выводов."""
     from .gost import pingroups
@@ -1332,9 +1437,15 @@ def check_gui_imports(res: Result):
         w = MainWindow(cfg)
         res.check("главное окно собирается", w is not None)
 
-        from .gui.dialogs import KicadDialog, SettingsDialog, LcscDialog
+        from .gui.dialogs import (KicadDialog, KicadExportDialog,
+                                  SettingsDialog, LcscDialog)
         for name, mk in (("импорт из KiCad", lambda: KicadDialog(svc)),
                          ("настройки", lambda: SettingsDialog(cfg)),
+                         ("настройки с сервисом", lambda: SettingsDialog(
+                             cfg, tools=[("Группа", [("Действие",
+                                                      lambda: None, "")])])),
+                         ("экспорт в проект KiCad",
+                          lambda: KicadExportDialog(cfg, ["R1", "C1"])),
                          ("импорт по LCSC", lambda: LcscDialog())):
             try:
                 d = mk()
@@ -1658,6 +1769,114 @@ def check_job(res: Result, st):
     res.check("указатель ведёт на задание", pointed == jp, pointed)
 
 
+def check_kicad_project(res: Result):
+    """
+    Выгрузка в проект KiCad.
+
+    Главное -- ничего чужого не сломать: символы, нарисованные в
+    библиотеке проекта руками, и чужие записи в таблицах библиотек
+    остаются как были, а повторная выгрузка заменяет, а не дублирует.
+    """
+    from .emit import kicadproj as kp
+    from .sources import kicad as kc
+    from .ir import Footprint, Model3D, Pad
+    c = _mk("ESD_TEST", "tvs",
+            [("1", "A", "passive"), ("2", "K", "passive")])
+    c.footprints = [Footprint(name="SOD-523", pads=[
+        Pad(number="1", x=-0.7, y=0, w=0.6, h=0.5),
+        Pad(number="2", x=0.7, y=0, w=0.6, h=0.5)])]
+    symbolgen.build(c)
+    with tempfile.TemporaryDirectory() as td:
+        proj = os.path.join(td, "board")
+        os.makedirs(os.path.join(proj, "GostLib"))
+        with open(os.path.join(proj, "board.kicad_pro"), "w") as f:
+            f.write("{}")
+        mdl = os.path.join(td, "sod523.step")
+        with open(mdl, "w") as f:
+            f.write("ISO-10303-21;\nDATA;\nENDSEC;\n")
+        c.footprints[0].model = Model3D(path=mdl)
+        hand = ('(kicad_symbol_lib (version 20231120) (generator "x")\n'
+                '  (symbol "HAND (made)" (in_bom yes)\n'
+                '    (property "Reference" "U" (at 0 0 0))\n  )\n)\n')
+        with open(os.path.join(proj, "GostLib", "GostLib.kicad_sym"),
+                  "w", encoding="utf-8") as f:
+            f.write(hand)
+        other = ('(fp_lib_table\n  (version 7)\n  (lib (name "Other")'
+                 '(type "KiCad")(uri "${KIPRJMOD}/o.pretty")(options "")'
+                 '(descr ""))\n)\n')
+        with open(os.path.join(proj, "fp-lib-table"), "w") as f:
+            f.write(other)
+
+        r = kp.export_project([c], proj, "GostLib")
+        lib = open(r["lib"], encoding="utf-8").read()
+        res.check("KiCad: символ дописан в библиотеку проекта",
+                  r["added"] == ["ESD_TEST"] and '"ESD_TEST"' in lib,
+                  str(r["added"]))
+        res.check("KiCad: символ, нарисованный руками, на месте",
+                  '(symbol "HAND (made)"' in lib, "")
+        syms = kc.parse_kicad_sym(r["lib"])
+        res.check("KiCad: библиотека читается парсером KiCad",
+                  sorted(syms) == ["ESD_TEST", "HAND (made)"],
+                  str(sorted(syms)))
+        res.check("KiCad: символ ссылается на свою посадку",
+                  syms.get("ESD_TEST", {}).get("props", {}).get("Footprint")
+                  == "GostLib:SOD-523",
+                  str(syms.get("ESD_TEST", {}).get("props", {})))
+        fpt = open(os.path.join(proj, "fp-lib-table")).read()
+        res.check("KiCad: чужая запись в fp-lib-table осталась",
+                  '(name "Other")' in fpt and '(name "GostLib")' in fpt, fpt)
+        res.check("KiCad: sym-lib-table создан с путём через ${KIPRJMOD}",
+                  "${KIPRJMOD}/GostLib/GostLib.kicad_sym" in open(
+                      os.path.join(proj, "sym-lib-table")).read(), "")
+        mod = open(r["footprints"][0], encoding="utf-8").read()
+        res.check("KiCad: 3D-модель скопирована и прописана относительно "
+                  "проекта",
+                  os.path.isfile(os.path.join(proj, "GostLib",
+                                              "GostLib.3dshapes",
+                                              "sod523.step"))
+                  and "${KIPRJMOD}/GostLib/GostLib.3dshapes/sod523.step"
+                  in mod, "")
+        r2 = kp.export_project([c], proj, "GostLib")
+        lib2 = open(r2["lib"], encoding="utf-8").read()
+        res.check("KiCad: повторная выгрузка заменяет, а не дублирует",
+                  r2["replaced"] == ["ESD_TEST"]
+                  and lib2.count('(symbol "ESD_TEST"') == 1
+                  and r2["tables"] == {"sym": "present", "fp": "present"},
+                  f"{r2['replaced']} {r2['tables']}")
+        # библиотека с тем же именем, но другим путём -- не наша: не трогаем
+        with open(os.path.join(proj, "sym-lib-table"), "w") as f:
+            f.write('(sym_lib_table\n  (version 7)\n  (lib (name "GostLib")'
+                    '(type "KiCad")(uri "D:/elsewhere/G.kicad_sym")'
+                    '(options "")(descr ""))\n)\n')
+        r3 = kp.export_project([c], proj, "GostLib")
+        res.check("KiCad: чужая библиотека с тем же именем не перезаписана",
+                  str(r3["tables"].get("sym", "")).startswith("conflict:")
+                  and "D:/elsewhere" in open(
+                      os.path.join(proj, "sym-lib-table")).read(),
+                  str(r3["tables"]))
+        # раздельные папки
+        s_dir = os.path.join(proj, "sym")
+        f_dir = os.path.join(proj, "fp", "My.pretty")
+        m_dir = os.path.join(proj, "3d")
+        r4 = kp.export_project([c], proj, "My", sym_dir=s_dir, fp_dir=f_dir,
+                               model_dir=m_dir)
+        res.check("KiCad: символ, посадка и 3D -- по своим папкам",
+                  os.path.isfile(os.path.join(s_dir, "My.kicad_sym"))
+                  and os.path.isfile(os.path.join(f_dir, "SOD-523.kicad_mod"))
+                  and os.path.isfile(os.path.join(m_dir, "sod523.step")), "")
+
+    k = _mk("R", "resistor", [("1", "~", "passive"), ("2", "~", "passive")])
+    k.source, k.source_ref = "kicad", "Device.kicad_sym::R"
+    k.params["KiCadFootprint"] = "Resistor_SMD:R_0603_1608Metric"
+    o = kp.kicad_origin(k)
+    res.check("KiCad: для компонента из KiCad названы исходные символ и "
+              "посадка",
+              o is not None and o["symbol"] == "Device:R"
+              and o["footprint"] == "Resistor_SMD:R_0603_1608Metric", str(o))
+    res.check("KiCad: компонент из LCSC не считается пришедшим из KiCad",
+              kp.kicad_origin(c) is None, "")
+
+
 def check_kicad(res: Result):
     from .sources import kicad as kc
     sym = """(kicad_symbol_lib (version 20211014) (generator test)
@@ -1786,6 +2005,87 @@ def _check_easyeda_symbol(res: Result, ee):
         {"dataStr": {"head": {"x": 170, "y": 20}, "shape": shapes}})
     res.check("EasyEDA: графика доезжает до символа",
               len(sprims) == len(prims), f"{len(sprims)}/{len(prims)}")
+
+
+def check_easyeda_step(res: Result):
+    """
+    Родной STEP из EasyEDA вместо перегонки OBJ.
+
+    STEP производителя цветной и точный, но лежит в своей системе
+    координат. Ставим его по OBJ (тот уже в координатах посадки) и только
+    если габариты совпали; иначе -- прежний путь через OBJ.
+    """
+    from .sources import easyeda as ee
+    box = [(x, y, z) for x in (-1.0, 1.0) for y in (-0.5, 0.5)
+           for z in (0.0, 0.5)]
+
+    def step_of(shift, k=1.0):
+        out = ["ISO-10303-21;", "HEADER;", "ENDSEC;", "DATA;"]
+        n = 1
+        for x, y, z in box:
+            out.append(f"#{n}=CARTESIAN_POINT('',({(x + shift[0]) * k:.4f},"
+                       f"{(y + shift[1]) * k:.4f},{(z + shift[2]) * k:.4f}));")
+            out.append(f"#{n + 1}=VERTEX_POINT('',#{n});")
+            n += 2
+        # начало системы координат -- не вершина, в габарит не входит
+        out.append("#900=CARTESIAN_POINT('',(100.,100.,100.));")
+        out += ["ENDSEC;", "END-ISO-10303-21;"]
+        return "\n".join(out).encode()
+
+    obj = ("".join(f"v {x} {y} {z - 0.25}\n" for x, y, z in box)
+           + "f 1 2 3\n").encode()
+    res.check("EasyEDA STEP: страница ошибки за STEP не принимается",
+              not ee.is_step(b"<html>404 Not Found</html>")
+              and ee.is_step(step_of((0, 0, 0))), "")
+
+    real_get = ee._get
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            ee._get = lambda url, log=None, **k: (
+                step_of((5.0, 3.0, 1.0)) if "qAxj" in url else obj)
+            logs: List[str] = []
+            m = ee.download_model("u1", td, "BOX", log=logs.append,
+                                  cache_dir=os.path.join(td, "c1"))
+            res.check("EasyEDA STEP: берётся родной STEP",
+                      m is not None and m.path.endswith("BOX.step")
+                      and ee.is_step(open(m.path, "rb").read()),
+                      " | ".join(logs))
+            res.check("EasyEDA STEP: встал туда же, где OBJ",
+                      m is not None and abs(m.dx + 5.0) < 1e-6
+                      and abs(m.dy + 3.0) < 1e-6,
+                      f"{m.dx if m else None}/{m.dy if m else None}")
+            # у OBJ ноль по центру корпуса -- SMD всё равно садится дном
+            # на плату, иначе корпус утоплен наполовину
+            res.check("EasyEDA STEP: SMD сидит на плате",
+                      m is not None and abs(m.dz + 1.0) < 1e-6,
+                      str(m.dz if m else None))
+            m2 = ee.download_model("u1", td, "BOX2", log=logs.append,
+                                   cache_dir=os.path.join(td, "c1"), tht=True)
+            res.check("EasyEDA STEP: выводной корпус -- Z как у OBJ",
+                      m2 is not None and abs(m2.dz + 1.25) < 1e-6,
+                      str(m2.dz if m2 else None))
+            # модель в дюймах (в 25.4 раза крупнее) -- это не та система
+            # координат: ставить её нельзя, возвращаемся к OBJ
+            ee._get = lambda url, log=None, **k: (
+                step_of((0, 0, 0), 25.4) if "qAxj" in url else obj)
+            logs = []
+            m3 = ee.download_model("u2", td, "BOX3", log=logs.append,
+                                   cache_dir=os.path.join(td, "c2"))
+            res.check("EasyEDA STEP: чужой габарит -- берётся OBJ",
+                      any("другой системе координат" in l for l in logs)
+                      and not (m3 and (m3.dx or m3.dy)),
+                      " | ".join(logs))
+            # пришла страница ошибки -- молча на OBJ, без падения
+            ee._get = lambda url, log=None, **k: (
+                b"<html>oops</html>" if "qAxj" in url else obj)
+            logs = []
+            ee.download_model("u3", td, "BOX4", log=logs.append,
+                              cache_dir=os.path.join(td, "c3"))
+            res.check("EasyEDA STEP: мусор вместо STEP -- берётся OBJ",
+                      any("что-то другое" in l for l in logs),
+                      " | ".join(logs))
+    finally:
+        ee._get = real_get
 
 
 def check_easyeda(res: Result):
@@ -2863,6 +3163,8 @@ def run(st=None) -> Result:
     res.run("задание для Altium", lambda: check_job(res, st))
     res.run("парсеры KiCad", lambda: check_kicad(res))
     res.run("парсеры EasyEDA", lambda: check_easyeda(res))
+    res.run("родной STEP из EasyEDA", lambda: check_easyeda_step(res))
+    res.run("выгрузка в проект KiCad", lambda: check_kicad_project(res))
     res.run("обмен раскладкой с ИИ", lambda: check_pin_plan(res))
     res.run("конвертер OBJ->STEP", lambda: check_step(res))
     res.run("каталог", lambda: check_db(res))
@@ -2889,6 +3191,7 @@ def run(st=None) -> Result:
     res.run("бюджет 3D-модели", lambda: check_model_budget(res))
     res.run("крупные 3D-модели", lambda: check_heavy_models(res))
     res.run("бюджет просмотра 3D", lambda: check_view_budget(res))
+    res.run("встроенные правила выводов", lambda: check_default_pin_rules(res, st))
     res.run("версия в сборке", lambda: check_build_version(res))
     res.run("посадка 3D на плату", lambda: check_model_seating(res))
     res.run("цвет модели держится",

@@ -250,7 +250,10 @@ def _ordered_rows(pins: List[SymPin], st: Style) -> List[Optional[SymPin]]:
             groups[g] = []
             order.append(g)
         groups[g].append(p)
-    order.sort()
+    # Группы по имени, но «прижатые к низу» (правило с «+низ», префикс
+    # «!~») -- в самый конец стороны: земля по ЕСКД стоит внизу слева, а
+    # просто по алфавиту она оказывалась над половиной порта GPIO.
+    order.sort(key=lambda g: (1 if g.startswith("!~") else 0, g))
     rows: List[Optional[SymPin]] = []
     prev_big = None
     prev_rank = None
@@ -279,6 +282,14 @@ def build_box(comp: Component, st: Style, unit: int = 1,
               label: str = "") -> Tuple[List[SymPrim], List[SymPin], int, int]:
     pins = [p for p in comp.symbol.pins if p.unit == unit]
     assign_sides(pins, getattr(st, "_pin_rules", None))
+    # Верх и низ корпуса по ГОСТ пока не рисуются. Раньше вывод со
+    # стороной T или B просто пропадал из символа -- теперь уходит на
+    # ближайшую боковую сторону.
+    for p in pins:
+        if p.side == "T":
+            p.side = "L"
+        elif p.side == "B":
+            p.side = "R"
     left = [p for p in pins if p.side == "L"]
     right = [p for p in pins if p.side == "R"]
     by_rule = any((p.group or "").startswith("!") for p in pins)

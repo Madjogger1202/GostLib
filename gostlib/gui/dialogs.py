@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -126,7 +126,7 @@ class KicadDialog(QDialog):
         lay.addLayout(hi)
         lay.addWidget(self.progress)
 
-        g1 = QGroupBox("Схемный символ")
+        g1 = QGroupBox("Символ")
         v1 = QVBoxLayout(g1)
         v1.addWidget(self.sym_edit)
         v1.addWidget(self.sym_list)
@@ -574,9 +574,21 @@ class ProjectsDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, cfg: config.Config, parent=None):
+    """
+    Настройки плюс редкие служебные действия.
+
+    tools -- [(группа, [(подпись, функция, подсказка), ...]), ...]. Раньше
+    это меню «Запасные пути» висело на главной панели и мозолило глаза,
+    хотя нужно оно раз в месяц. Нажатая кнопка сохраняет настройки,
+    закрывает окно и запоминает действие в self.chosen -- выполняет его уже
+    главное окно, когда модальный диалог закрыт.
+    """
+
+    def __init__(self, cfg: config.Config, parent=None, tools=None):
         super().__init__(parent)
         self.cfg = cfg
+        self.chosen = None
+        self._tools = list(tools or [])
         self.setWindowTitle("Настройки GostLib")
 
         self.lib_name = QLineEdit(cfg.library_name)
@@ -751,6 +763,45 @@ class SettingsDialog(QDialog):
             "Обычно модели держат отдельно, а в репозитории только "
             "описания компонентов.")
 
+        # --- работа с программой
+        self.imp_proj = QCheckBox("импортированное сразу добавлять в текущий "
+                                  "проект")
+        self.imp_proj.setChecked(bool(getattr(cfg, "import_to_project", True)))
+        self.imp_proj.setToolTip(
+            "Иначе компонент осядет только в общем каталоге, и при показе "
+            "состава проекта его не будет видно.")
+        self.show_job = QCheckBox("показывать кнопку «Собрать задание» (F9)")
+        self.show_job.setChecked(bool(getattr(cfg, "show_job_button", False)))
+        self.show_job.setToolTip(
+            "Задание без запуска Altium нужно редко: обычно хватает "
+            "«Собрать и запустить» (Shift+F9).\nКлавиша F9 работает и со "
+            "спрятанной кнопкой.")
+        self.ee_step = QCheckBox("3D из EasyEDA — родной STEP производителя "
+                                 "(цветной)")
+        self.ee_step.setChecked(bool(getattr(cfg, "easyeda_step", True)))
+        self.ee_step.setToolTip(
+            "Модель производителя: точная геометрия и родные цвета. Ставится "
+            "по сетке OBJ, файл не правится.\nЕсли её нет или она в чужой "
+            "системе координат — берётся OBJ, как раньше.\nСнимите, если "
+            "какая-то модель встала криво.")
+
+        # --- экспорт в KiCad
+        self.kc_warn = QCheckBox("предупреждать, если компонент и так из "
+                                 "KiCad")
+        self.kc_warn.setChecked(bool(getattr(cfg, "kicad_export_warn", True)))
+        self.kc_warn.setToolTip(
+            "Компонент из библиотек KiCad проще подключить к проекту как "
+            "есть. Предупреждение называет исходные символ, посадку и 3D.")
+        self.kc_split = QCheckBox("по умолчанию раскладывать символ, посадку "
+                                  "и 3D по разным папкам")
+        self.kc_split.setChecked(bool(getattr(cfg, "kicad_export_split",
+                                              False)))
+        self.kc_lib = QLineEdit(getattr(cfg, "kicad_export_lib", "GostLib")
+                                or "GostLib")
+        self.kc_lib.setToolTip(
+            "Имя библиотеки в проекте KiCad: <имя>.kicad_sym, "
+            "<имя>.pretty, <имя>.3dshapes")
+
         self.altium = QLineEdit(cfg.altium_exe)
         alt_b = QPushButton("…")
         alt_b.setFixedWidth(30)
@@ -804,6 +855,21 @@ class SettingsDialog(QDialog):
         f3.addRow("", self.tbl_lines)
         tabs.addTab(w3, "Разъёмы")
 
+        w4 = QWidget(); f4 = QFormLayout(w4)
+        f4.addRow("Импорт:", self.imp_proj)
+        f4.addRow("Панель:", self.show_job)
+        f4.addRow("3D:", self.ee_step)
+        tabs.addTab(w4, "Работа")
+
+        w5 = QWidget(); f5 = QFormLayout(w5)
+        f5.addRow("Имя библиотеки:", self.kc_lib)
+        f5.addRow("", self.kc_split)
+        f5.addRow("", self.kc_warn)
+        tabs.addTab(w5, "Экспорт в KiCad")
+
+        if self._tools:
+            tabs.addTab(self._tools_tab(), "Сервис")
+
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -812,6 +878,42 @@ class SettingsDialog(QDialog):
         lay.addWidget(bb)
         from .widgets import fit_to_screen
         fit_to_screen(self, 560, 520)
+
+    def _tools_tab(self) -> QWidget:
+        """Вкладка служебных действий: по кнопке на действие, по группам."""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        for group, items in self._tools:
+            cap = QLabel(group)
+            f = cap.font()
+            f.setBold(True)
+            cap.setFont(f)
+            v.addWidget(cap)
+            for item in items:
+                label, fn = item[0], item[1]
+                tip = item[2] if len(item) > 2 else ""
+                b = QPushButton(label)
+                b.setStyleSheet("text-align:left;padding:4px 10px;")
+                if tip:
+                    b.setToolTip(tip)
+                b.clicked.connect(lambda _=False, f=fn: self._pick(f))
+                v.addWidget(b)
+            v.addSpacing(8)
+        note = QLabel("Кнопка сохраняет настройки, закрывает окно и "
+                      "выполняет действие.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#8a93a6;")
+        v.addWidget(note)
+        v.addStretch(1)
+        from PySide6.QtWidgets import QScrollArea
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setWidget(w)
+        return sc
+
+    def _pick(self, fn):
+        self.chosen = fn
+        self.accept()
 
     @staticmethod
     def _wrap(layout):
@@ -874,6 +976,12 @@ class SettingsDialog(QDialog):
         c.seat_models = self.seat3d.isChecked()
         c.git_dir = self.git_dir.text().strip()
         c.git_models = self.git_models.isChecked()
+        c.import_to_project = self.imp_proj.isChecked()
+        c.show_job_button = self.show_job.isChecked()
+        c.easyeda_step = self.ee_step.isChecked()
+        c.kicad_export_warn = self.kc_warn.isChecked()
+        c.kicad_export_split = self.kc_split.isChecked()
+        c.kicad_export_lib = self.kc_lib.text().strip() or "GostLib"
 
         black = 0 if self.black.isChecked() else None
         if black is not None:
@@ -887,6 +995,176 @@ class SettingsDialog(QDialog):
         c.altium_exe = self.altium.text().strip()
         c.save()
         return c
+
+
+class KicadExportDialog(QDialog):
+    """
+    Куда в проекте KiCad дописать компоненты.
+
+    По умолчанию всё ложится в одну папку <проект>/<библиотека>: там
+    <библиотека>.kicad_sym, <библиотека>.pretty и <библиотека>.3dshapes.
+    Снятая галочка открывает три отдельных пути -- для тех, у кого символы,
+    посадки и модели в проекте разложены по своим папкам.
+    """
+
+    def __init__(self, cfg: config.Config, names: List[str], parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setWindowTitle("Экспорт в проект KiCad")
+        from ..emit import kicadproj as kp
+        self._kp = kp
+
+        self.project = QLineEdit(getattr(cfg, "kicad_export_project", "") or "")
+        self.project.setPlaceholderText("файл .kicad_pro или папка проекта")
+        pb = QPushButton("…")
+        pb.setFixedWidth(30)
+        pb.clicked.connect(self._browse_project)
+        self.lib = QLineEdit(getattr(cfg, "kicad_export_lib", "GostLib")
+                             or "GostLib")
+        self.lib.setToolTip("Имя библиотеки в проекте: так она будет "
+                            "называться в таблицах библиотек KiCad")
+        self.one = QCheckBox("всё в одну папку проекта")
+        self.one.setChecked(not bool(getattr(cfg, "kicad_export_split",
+                                             False)))
+        self.one.setToolTip(
+            "<проект>/<библиотека>/: символы, .pretty и .3dshapes рядом.\n"
+            "Снимите, чтобы задать отдельные папки для символа, посадки и "
+            "3D-модели.")
+        self.d_sym = QLineEdit()
+        self.d_fp = QLineEdit()
+        self.d_3d = QLineEdit()
+        rows = []
+        for le, cap in ((self.d_sym, "Символ (.kicad_sym):"),
+                        (self.d_fp, "Посадка (.pretty):"),
+                        (self.d_3d, "3D-модель:")):
+            b = QPushButton("…")
+            b.setFixedWidth(30)
+            b.clicked.connect(lambda _=False, e=le: self._browse_dir(e))
+            h = QHBoxLayout()
+            h.addWidget(le, 1)
+            h.addWidget(b)
+            rows.append((cap, h))
+        self.register = QCheckBox("подключить библиотеки к проекту "
+                                  "(sym-lib-table и fp-lib-table)")
+        self.register.setChecked(True)
+        self.register.setToolTip(
+            "Запись добавляется, только если библиотеки с таким именем в "
+            "таблице ещё нет. Чужие записи не трогаются.")
+        self.copy3d = QCheckBox("копировать 3D-модели в проект")
+        self.copy3d.setChecked(True)
+        self.copy3d.setToolTip(
+            "Иначе посадка сошлётся на модель там, где она лежит сейчас, — "
+            "проект перестанет быть переносимым.")
+
+        what = QLabel(("Компонент: " if len(names) == 1 else
+                       f"Компонентов: {len(names)} — ") +
+                      ", ".join(names[:6]) + (" …" if len(names) > 6 else ""))
+        what.setWordWrap(True)
+        note = QLabel(
+            "Символы дописываются в библиотеку проекта: компонент с тем же "
+            "именем заменяется, остальные символы не трогаются. Если KiCad "
+            "открыт — переоткройте проект, чтобы он перечитал таблицы "
+            "библиотек.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#8a93a6;")
+
+        form = QFormLayout()
+        hp = QHBoxLayout()
+        hp.addWidget(self.project, 1)
+        hp.addWidget(pb)
+        form.addRow("Проект KiCad:", SettingsDialog._wrap(hp))
+        form.addRow("Библиотека:", self.lib)
+        form.addRow("", self.one)
+        self._dir_rows = []
+        for cap, h in rows:
+            w = SettingsDialog._wrap(h)
+            form.addRow(cap, w)
+            self._dir_rows.append((form.labelForField(w), w))
+        form.addRow("", self.register)
+        form.addRow("", self.copy3d)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("Экспортировать")
+        bb.accepted.connect(self._ok)
+        bb.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addWidget(what)
+        lay.addLayout(form)
+        lay.addWidget(note)
+        lay.addWidget(bb)
+
+        self.one.stateChanged.connect(self._layout_dirs)
+        self.project.textChanged.connect(self._fill_defaults)
+        self.lib.textChanged.connect(self._fill_defaults)
+        self._fill_defaults()
+        self._layout_dirs()
+        from .widgets import fit_to_screen
+        fit_to_screen(self, 620, 360)
+
+    def project_dir(self) -> str:
+        return self._kp.project_dir_of(self.project.text().strip())
+
+    def _fill_defaults(self):
+        pd = self.project_dir()
+        if not pd:
+            return
+        s, f, m = self._kp.default_dirs(pd, self.lib.text().strip()
+                                        or "GostLib",
+                                        split=not self.one.isChecked())
+        for le, v in ((self.d_sym, s), (self.d_fp, f), (self.d_3d, m)):
+            if not le.isModified():
+                le.setText(v)
+
+    def _layout_dirs(self):
+        split = not self.one.isChecked()
+        for lab, w in self._dir_rows:
+            w.setVisible(split)
+            if lab is not None:
+                lab.setVisible(split)
+        for le in (self.d_sym, self.d_fp, self.d_3d):
+            le.setModified(False)
+        self._fill_defaults()
+
+    def _browse_project(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Проект KiCad", self.project.text().strip(),
+            "Проект KiCad (*.kicad_pro);;Все файлы (*)")
+        if f:
+            self.project.setText(f)
+
+    def _browse_dir(self, le: QLineEdit):
+        d = QFileDialog.getExistingDirectory(self, "Папка", le.text().strip()
+                                             or self.project_dir())
+        if d:
+            le.setText(d)
+            le.setModified(True)
+
+    def _ok(self):
+        pd = self.project_dir()
+        if not pd or not os.path.isdir(pd):
+            QMessageBox.warning(self, "GostLib",
+                                "Укажите файл .kicad_pro или папку проекта "
+                                "KiCad.")
+            return
+        if not self._kp.find_project_file(pd):
+            r = QMessageBox.question(
+                self, "GostLib",
+                f"В папке нет файла .kicad_pro:\n{pd}\n\nВсё равно "
+                "выгрузить сюда?")
+            if r != QMessageBox.Yes:
+                return
+        self.cfg.kicad_export_split = not self.one.isChecked()
+        self.accept()
+
+    def values(self) -> Dict[str, object]:
+        split = not self.one.isChecked()
+        return {"project": self.project.text().strip(),
+                "lib": self.lib.text().strip() or "GostLib",
+                "sym_dir": self.d_sym.text().strip() if split else "",
+                "fp_dir": self.d_fp.text().strip() if split else "",
+                "model_dir": self.d_3d.text().strip() if split else "",
+                "register": self.register.isChecked(),
+                "copy_models": self.copy3d.isChecked()}
 
 
 class PickComponentsDialog(QDialog):

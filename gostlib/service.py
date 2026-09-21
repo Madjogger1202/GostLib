@@ -229,8 +229,12 @@ class Service:
         if not path or not os.path.isfile(path):
             return ""
         if not self.model_made_by_us(path):
-            return ("модель выбрана вручную — файл не трогаю, "
-                    "цвет останется таким, как в самом STEP")
+            # Не наш файл: либо выбран руками, либо это родной STEP
+            # производителя из EasyEDA -- у него свои цвета, и в обоих
+            # случаях файл не правим. В просмотре выбранный цвет виден.
+            return ("файл модели не наш (выбран вручную или родной STEP "
+                    "производителя) — его не трогаю, в Altium останутся "
+                    "цвета самого STEP")
         if not step_has_color(path):
             obj_path = os.path.splitext(path)[0] + ".obj"
             if not os.path.isfile(obj_path):
@@ -735,7 +739,9 @@ class Service:
         self.log(f"Запрашиваю {code} в EasyEDA ...")
         c = easyeda.fetch(code, out_dir=self.cfg.models_dir, log=self.log,
                           cache_dir=self.cfg.cache_dir,
-                          budget=int(getattr(self.cfg, "model_faces", 0) or 0))
+                          budget=int(getattr(self.cfg, "model_faces", 0) or 0),
+                          prefer_step=bool(getattr(self.cfg, "easyeda_step",
+                                                   True)))
         return self._absorb([c])
 
     # ------------------------------------------------------------ выгрузка --
@@ -1038,7 +1044,7 @@ class Service:
                      "разбирать их долго:")
             for nm, mb in heavy_3d[:5]:
                 self.log(f"    {nm}: {mb:.1f} МБ")
-            self.log("    «Запасные пути → Пережать 3D-модели» ускорит "
+            self.log("    «Настройки → Сервис → Пережать 3D-модели» ускорит "
                      "сборку в разы")
         if vendor:
             self.log(f"  вендорских библиотек посадок: {len(vendor)}")
@@ -1709,6 +1715,81 @@ class Service:
         return {"path": path, "dir": d,
                 "components": str(st.get("components", len(comps))),
                 "footprints": str(st.get("packages", 0))}
+
+    # ------------------------------------------------ проект KiCad --------
+    def export_kicad_project(self, uids: Iterable[str], project: str,
+                             lib: str = "", sym_dir: str = "",
+                             fp_dir: str = "", model_dir: str = "",
+                             register: bool = True,
+                             copy_models: bool = True) -> Dict[str, object]:
+        """
+        Дописать компоненты в библиотеки проекта KiCad (см. emit/kicadproj).
+
+        Символ уходит тот, что собран сейчас (по ГОСТ или родной -- как
+        выбрано у компонента), посадка и 3D-модель -- как в каталоге.
+        """
+        from .emit import kicadproj
+        comps = self.collect(uids)
+        for c in comps:
+            self.rebuild_symbol(c)          # только копия для выгрузки
+        lib = lib or getattr(self.cfg, "kicad_export_lib", "") or "GostLib"
+        res = kicadproj.export_project(
+            comps, project, lib=lib, sym_dir=sym_dir, fp_dir=fp_dir,
+            model_dir=model_dir, register=register, copy_models=copy_models,
+            log=self.log)
+        self.cfg.kicad_export_project = project
+        self.cfg.kicad_export_lib = lib
+        self.cfg.save()
+        return res
+
+    def kicad_origins(self, uids: Iterable[str]) -> List[Tuple[str, Dict[str, str]]]:
+        """[(имя, {symbol, footprint, model})] для компонентов, пришедших из KiCad."""
+        from .emit import kicadproj
+        out = []
+        for c in self.collect(uids):
+            o = kicadproj.kicad_origin(c)
+            if o:
+                out.append((c.name, o))
+        return out
+
+    def component_models(self, uids: Iterable[str]) -> List[Tuple[str, str]]:
+        """[(имя компонента, путь к модели)] -- у кого модель есть на диске."""
+        out = []
+        for c in self.collect(uids):
+            for fp in c.footprints:
+                m = getattr(fp, "model", None)
+                if m is not None and m.path and os.path.isfile(m.path):
+                    out.append((c.name, m.path))
+                    break
+        return out
+
+    def save_models(self, uids: Iterable[str], target: str) -> List[str]:
+        """
+        Сохранить 3D-модели компонентов.
+
+        target -- путь к файлу, если модель одна, иначе папка. Файл
+        копируется как есть: у родной модели производителя остаются её
+        цвета, у нашей -- выбранный цвет, он уже записан в файл.
+        """
+        models = self.component_models(uids)
+        done: List[str] = []
+        if not models:
+            return done
+        if len(models) == 1 and not os.path.isdir(target):
+            os.makedirs(os.path.dirname(os.path.abspath(target)) or ".",
+                        exist_ok=True)
+            shutil.copy2(models[0][1], target)
+            done.append(target)
+        else:
+            os.makedirs(target, exist_ok=True)
+            for _name, path in models:
+                dst = os.path.join(target, os.path.basename(path))
+                if os.path.abspath(dst) != os.path.abspath(path):
+                    shutil.copy2(path, dst)
+                done.append(dst)
+        for p in done:
+            self.log(f"3D-модель сохранена: {p}")
+        return done
 
     def export_kicad_bundle(self, comps: List[Component]) -> Dict[str, str]:
         """KiCad .kicad_sym + .pretty -- дальше File > Import Wizard > KiCad."""

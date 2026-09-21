@@ -6,8 +6,9 @@
 но родное обозначение сохраняется и его можно выбрать),
 посадочное место (переносится геометрически) и, по возможности, 3D-модель.
 
-EasyEDA отдаёт 3D в формате OBJ; Altium понимает STEP, поэтому OBJ
-конвертируется модулем mesh2step.
+3D берётся родным STEP производителя: он цветной и точный. Если его нет
+или он лежит в чужой системе координат -- EasyEDA отдаёт ту же модель в
+OBJ, и она переводится в STEP модулем mesh2step.
 """
 from __future__ import annotations
 
@@ -26,6 +27,16 @@ from ..ir import (Component, Footprint, FpPrim, Model3D, Pad, SymPin,
 API_COMPONENT = ("https://easyeda.com/api/products/{code}/components"
                  "?version=6.4.19.5")
 API_3D_OBJ = "https://modules.easyeda.com/3dmodel/{uuid}"
+# Родной STEP той же модели. EasyEDA хранит его рядом с OBJ под тем же uuid
+# (этим путём пользуется и easyeda2kicad). Это настоящая твердотельная
+# модель производителя: точная геометрия и свои цвета, без перегонки
+# сетки и без потерь на огрублении.
+API_3D_STEP = "https://modules.easyeda.com/qAxj6KHrDKw4blvCG8QJPs7Y/{uuid}"
+
+# Насколько габариты STEP и OBJ могут расходиться, чтобы считать их одной
+# и той же моделью в одной системе координат.
+STEP_FIT_REL = 0.08         # доля габарита
+STEP_FIT_ABS = 0.05         # мм -- для крошечных корпусов
 UA = {"User-Agent": "Mozilla/5.0 (compatible; GostLib/1.0)",
       "Accept-Encoding": "gzip, deflate",
       "Accept": "application/json, text/plain, */*"}
@@ -641,7 +652,8 @@ def _parse_footprint(pkg: dict) -> Tuple[Footprint, str]:
 # ------------------------------------------------------------------ сборка ---
 
 def fetch(code: str, out_dir: str = "", want_3d: bool = True,
-          log=None, cache_dir: str = "", budget: int = 0) -> Component:
+          log=None, cache_dir: str = "", budget: int = 0,
+          prefer_step: bool = True) -> Component:
     import time as _time
     log = log or (lambda *_: None)
     t0 = _time.time()
@@ -702,11 +714,15 @@ def fetch(code: str, out_dir: str = "", want_3d: bool = True,
     if want_3d and model_uuid and out_dir:
         t1 = _time.time()
         try:
-            path = download_3d(model_uuid, out_dir, c.footprints[0].name
-                               if c.footprints else c.name, log=log,
-                               cache_dir=cache_dir, budget=budget)
-            if path and c.footprints:
-                c.footprints[0].model = Model3D(path=path)
+            fp0 = c.footprints[0] if c.footprints else None
+            tht = bool(fp0 and any(float(getattr(p, "hole", 0) or 0) > 0
+                                   for p in fp0.pads))
+            model = download_model(model_uuid, out_dir,
+                                   fp0.name if fp0 else c.name, log=log,
+                                   cache_dir=cache_dir, budget=budget,
+                                   tht=tht, prefer_step=prefer_step)
+            if model and fp0 is not None:
+                fp0.model = model
             log(f"  3D готова за {_time.time() - t1:.1f} с")
         except Exception as e:      # 3D не критично
             log(f"3D-модель не получена: {e}")
@@ -714,41 +730,241 @@ def fetch(code: str, out_dir: str = "", want_3d: bool = True,
     return c
 
 
+def _fetch_cached(url: str, cached: str, log, what: str) -> bytes:
+    """Файл из кеша, а если его нет -- из сети с сохранением в кеш."""
+    import time as _time
+    if cached and os.path.isfile(cached):
+        try:
+            with open(cached, "rb") as f:
+                data = f.read()
+            if data:
+                log(f"  3D ({what}): взята из кеша")
+                return data
+        except OSError:
+            pass
+    t0 = _time.time()
+    data = _get(url, log=log)
+    log(f"  3D ({what}): скачано {len(data) // 1024} КБ за "
+        f"{_time.time() - t0:.1f} с")
+    if cached and data:
+        try:
+            with open(cached, "wb") as f:
+                f.write(data)
+        except OSError:
+            pass
+    return data
+
+
+def _get_obj(uuid: str, cache_dir: str, log) -> str:
+    """OBJ модели по uuid (кешируется: он не меняется, а весит порой десятки МБ)."""
+    raw = _fetch_cached(API_3D_OBJ.format(uuid=uuid),
+                        _cache_file(cache_dir, f"3d_{uuid}.obj"), log,
+                        "OBJ").decode("utf-8", "replace")
+    if "v " not in raw:
+        raise EasyEdaError("EasyEDA вернул не OBJ")
+    return raw
+
+
+def is_step(data: bytes) -> bool:
+    """Похоже ли это на файл STEP (ISO 10303-21), а не на страницу ошибки."""
+    head = (data or b"")[:512].lstrip()
+    return head.startswith(b"ISO-10303-21") and b"DATA;" in (data or b"")[:1 << 20]
+
+
+def _obj_bbox(raw: str):
+    """Габарит OBJ по вершинам: (x0, y0, z0, x1, y1, z1) в мм."""
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    for line in raw.splitlines():
+        if not line.startswith("v "):
+            continue
+        p = line.split()
+        try:
+            v = (float(p[1]), float(p[2]), float(p[3]))
+        except (IndexError, ValueError):
+            continue
+        for i in range(3):
+            lo[i] = min(lo[i], v[i])
+            hi[i] = max(hi[i], v[i])
+    if lo[0] == float("inf"):
+        return None
+    return (lo[0], lo[1], lo[2], hi[0], hi[1], hi[2])
+
+
+_VTX_RE = re.compile(
+    rb"#(\d+)\s*=\s*CARTESIAN_POINT\s*\(\s*'[^']*'\s*,\s*\(\s*"
+    rb"([-+.\dEe]+)\s*,\s*([-+.\dEe]+)\s*,\s*([-+.\dEe]+)")
+_VREF_RE = re.compile(rb"VERTEX_POINT\s*\(\s*'[^']*'\s*,\s*#(\d+)")
+
+
+def _step_bbox(path: str, work_dir: str = ""):
+    """
+    Габарит STEP в мм.
+
+    Точнее всего -- по настоящей сетке (там учтены размещения деталей
+    сборки: выводы у многих моделей лежат отдельными деталями со своим
+    смещением). Если пакетов для сетки нет -- по вершинам тел; это верно
+    для моделей из одного тела, а для сборки габарит может выйти врасплох,
+    и тогда сверка с OBJ честно не сойдётся.
+    """
+    try:
+        from .. import mesh3d
+        m = mesh3d.load(path, cache_dir=os.path.join(
+            work_dir or os.path.dirname(path), "_mesh_cache"), tol=0.2)
+        if m.ok:
+            return m.bbox()
+    except Exception:
+        pass
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    pts = {int(m.group(1)): m for m in _VTX_RE.finditer(data)}
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    for ref in _VREF_RE.finditer(data):
+        m = pts.get(int(ref.group(1)))
+        if not m:
+            continue
+        try:
+            v = (float(m.group(2)), float(m.group(3)), float(m.group(4)))
+        except ValueError:
+            continue
+        for i in range(3):
+            lo[i] = min(lo[i], v[i])
+            hi[i] = max(hi[i], v[i])
+    if lo[0] == float("inf"):
+        return None
+    return (lo[0], lo[1], lo[2], hi[0], hi[1], hi[2])
+
+
+def _fits(a, b) -> bool:
+    """Совпадают ли габариты двух моделей по каждой оси."""
+    for i in range(3):
+        sa, sb = a[i + 3] - a[i], b[i + 3] - b[i]
+        if abs(sa - sb) > max(STEP_FIT_REL * max(sa, sb), STEP_FIT_ABS):
+            return False
+    return True
+
+
+def place_step(step_box, obj_box, tht: bool = False):
+    """
+    Смещение, которое ставит родной STEP туда же, где стоит OBJ.
+
+    OBJ у EasyEDA уже в координатах посадочного места (по центру), а STEP
+    остаётся в системе координат, в которой его рисовал производитель, --
+    часто со сдвигом. Сверяем габариты: совпали -- это одна и та же модель,
+    и разница центров и есть нужное смещение. Не совпали (другие единицы,
+    модель повёрнута осью вверх) -- возвращаем None, и берётся OBJ: лучше
+    знакомая сетка на своём месте, чем точная модель поперёк платы.
+
+    По Z у SMD-корпуса дно садится на плату (Z = 0): у OBJ бывает ноль по
+    центру корпуса. У выводного Z берётся как у OBJ -- ножки ниже платы.
+    """
+    if not step_box:
+        return None
+    if obj_box is not None and not _fits(step_box, obj_box):
+        return None
+    if obj_box is None:
+        cx = cy = 0.0
+        z0 = 0.0
+    else:
+        cx = (obj_box[0] + obj_box[3]) / 2.0
+        cy = (obj_box[1] + obj_box[4]) / 2.0
+        z0 = obj_box[2]
+    dx = cx - (step_box[0] + step_box[3]) / 2.0
+    dy = cy - (step_box[1] + step_box[4]) / 2.0
+    dz = (z0 if tht else 0.0) - step_box[2]
+    return (dx, dy, dz)
+
+
+def download_model(uuid: str, out_dir: str, base: str, log=None,
+                   cache_dir: str = "", budget: int = 0, tht: bool = False,
+                   prefer_step: bool = True) -> Optional[Model3D]:
+    """
+    3D-модель компонента: родной STEP производителя, а если не вышло --
+    STEP, собранный из OBJ.
+
+    Родной STEP цветной и точный, но лежит в своей системе координат,
+    поэтому ставится по OBJ: смещение кладётся в Model3D, сам файл не
+    правится.
+    """
+    log = log or (lambda *_: None)
+    os.makedirs(out_dir, exist_ok=True)
+    raw_obj = ""
+    try:
+        raw_obj = _get_obj(uuid, cache_dir, log)
+    except Exception as e:
+        log(f"  3D: OBJ не получен ({e})")
+
+    if prefer_step:
+        try:
+            data = _fetch_cached(API_3D_STEP.format(uuid=uuid),
+                                 _cache_file(cache_dir, f"3d_{uuid}.step"),
+                                 log, "STEP")
+        except Exception as e:
+            data = b""
+            log(f"  3D: родного STEP нет ({e})")
+        if data and not is_step(data):
+            log("  3D: вместо STEP пришло что-то другое — беру OBJ")
+            data = b""
+        if data:
+            step_path = os.path.join(out_dir, f"{base}.step")
+            with open(step_path, "wb") as f:
+                f.write(data)
+            # Сетка с тем же именем рядом перехватила бы просмотр
+            # (mesh3d.preview_source), и в окне была бы старая серая
+            # модель вместо цветной.
+            for ext in (".obj", ".stl"):
+                stale = os.path.join(out_dir, base + ext)
+                if os.path.isfile(stale):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+            obj_box = _obj_bbox(raw_obj) if raw_obj else None
+            step_box = _step_bbox(step_path, out_dir)
+            off = place_step(step_box, obj_box, tht=tht)
+            if off is not None:
+                dx, dy, dz = off
+                log(f"3D: родной STEP производителя (цветной) -> "
+                    f"{os.path.basename(step_path)}"
+                    + (f", смещение {dx:+.2f}/{dy:+.2f}/{dz:+.2f} мм"
+                       if max(abs(dx), abs(dy), abs(dz)) > 1e-3 else ""))
+                return Model3D(path=step_path, dx=dx, dy=dy, dz=dz)
+            if step_box and raw_obj:
+                sb = step_box
+                ob = obj_box
+                log("  3D: родной STEP в другой системе координат (габарит "
+                    f"{sb[3] - sb[0]:.2f}x{sb[4] - sb[1]:.2f}x{sb[5] - sb[2]:.2f}"
+                    f" против {ob[3] - ob[0]:.2f}x{ob[4] - ob[1]:.2f}x"
+                    f"{ob[5] - ob[2]:.2f} мм у OBJ) — беру OBJ, он стоит "
+                    "на своём месте")
+            else:
+                log("  3D: габарит родного STEP не определился — беру OBJ")
+
+    if not raw_obj:
+        raise EasyEdaError("ни STEP, ни OBJ получить не удалось")
+    path = download_3d(uuid, out_dir, base, log=log, cache_dir=cache_dir,
+                       budget=budget, raw=raw_obj)
+    return Model3D(path=path) if path else None
+
+
 def download_3d(uuid: str, out_dir: str, base: str, log=None,
-                cache_dir: str = "", budget: int = 0) -> str:
+                cache_dir: str = "", budget: int = 0, raw: str = "") -> str:
     """
     Скачать OBJ и перевести его в STEP, который понимает Altium.
 
-    Скачанный OBJ кладётся в кеш по uuid: он не меняется, а весит иногда
-    десятки мегабайт. Повторный импорт того же компонента (а его повторяют
-    часто) не трогает сеть вообще.
+    Запасной путь: основной -- родной STEP (download_model). Скачанный OBJ
+    кладётся в кеш по uuid: он не меняется, а весит иногда десятки
+    мегабайт, и повторный импорт того же компонента сеть не трогает.
     """
     import time as _time
     log = log or (lambda *_: None)
     os.makedirs(out_dir, exist_ok=True)
-
-    raw = ""
-    cached = _cache_file(cache_dir, f"3d_{uuid}.obj")
-    if cached and os.path.isfile(cached):
-        try:
-            raw = open(cached, encoding="utf-8", errors="replace").read()
-            log("  3D: взята из кеша")
-        except OSError:
-            raw = ""
     if not raw:
-        t0 = _time.time()
-        raw = _get(API_3D_OBJ.format(uuid=uuid), log=log
-                   ).decode("utf-8", "replace")
-        log(f"  3D: скачано {len(raw) // 1024} КБ за "
-            f"{_time.time() - t0:.1f} с")
-        if cached:
-            try:
-                with open(cached, "w", encoding="utf-8") as f:
-                    f.write(raw)
-            except OSError:
-                pass
-    if "v " not in raw:
-        raise EasyEdaError("EasyEDA вернул не OBJ")
+        raw = _get_obj(uuid, cache_dir, log)
 
     obj_path = os.path.join(out_dir, f"{base}.obj")
     with open(obj_path, "w", encoding="utf-8") as f:
