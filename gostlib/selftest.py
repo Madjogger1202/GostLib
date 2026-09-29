@@ -198,6 +198,19 @@ def check_slots(res: Result):
     txt = aj.build_job([c], "a", "b")
     pads = [l.split("\t") for l in txt.splitlines() if l.startswith("PAD")]
     got = {p[1]: p for p in pads}
+    # У SMD-площадки в задании отверстие обязано быть нулём: скрипт пишет
+    # это значение в Altium как есть, а заготовка площадки приходит с
+    # отверстием 30 mil из умолчаний Altium.
+    from .ir import Footprint, Pad
+    smd = Component(name="SMD_ONLY", ctype="ic")
+    smd.footprints.append(Footprint(name="SOT23", pads=[
+        Pad(number="1", x=-0.95, y=-1.0, w=0.6, h=0.7),
+        Pad(number="2", x=0.95, y=-1.0, w=0.6, h=0.7)]))
+    jp = [l.split("\t") for l in aj.build_job([smd], "a", "b").splitlines()
+          if l.startswith("PAD")]
+    res.check("в задании у SMD-площадки отверстие 0",
+              jp and all(int(p[9]) == 0 for p in jp),
+              str([(p[1], p[9]) for p in jp]))
     res.check("угол паза уходит в задание",
               int(got["MP"][12]) == 900 and int(got["MP2"][12]) == 0,
               f"{got['MP'][12]} / {got['MP2'][12]}")
@@ -510,6 +523,17 @@ def check_build_report(res: Result):
     for token in ("WriteResult", "GMadeSch", "GMadePcb", "'.done'"):
         res.check(f"скрипт умеет отчёт: {token}", token in text,
                   "нет в .pas")
+
+    # Отверстие площадки скрипт обязан задавать ВСЕГДА, а не только когда
+    # оно ненулевое: заготовка от PCBObjectFactory приходит с отверстием
+    # 30 mil, и у SMD-площадки оно оставалось скрытой неметаллизированной
+    # дыркой 0,762 мм. На BGA с шагом 0,36 мм это сотни ошибок DRC.
+    body = text[text.find("hl := FldI(line, 10)"):]
+    head = body[:body.find("If hl > 0")]
+    res.check("скрипт обнуляет отверстие SMD-площадки",
+              "Pad.HoleSize := hl;" in head
+              and body.find("Pad.HoleSize := hl;") < body.find("If hl > 0"),
+              "Pad.HoleSize задаётся только внутри «If hl > 0»")
 
 
 def _read_pas(path: str) -> str:
@@ -2413,6 +2437,9 @@ def check_pcblib_writer(res: Result):
               str(th[0]["layer"]) if th else "нет")
     smd = [p for p in info["pads"] if p["hole"] == 0]
     res.check("PcbLib: SMD-площадки на Top", all(p["layer"] == 1 for p in smd))
+    res.check("PcbLib: у SMD-площадки нет отверстия",
+              all(abs(p["hole"]) < 1e-9 for p in smd),
+              str([p["hole"] for p in smd]))
     # регрессия: путь Windows в строке замены re ронял запись
     from .emit.pcblib import _patch_filename
     win = r"C:\Users\vakva\AppData\Local\GostLib\library\GOST_Lib.PcbLib"

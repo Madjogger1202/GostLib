@@ -495,9 +495,19 @@ Begin
     Pad.Rotation := FldI(line, 8) / 10.0;
     Pad.Layer := PadLayerOf(FldI(line, 9));
     hl := FldI(line, 10);
+    { Отверстие пишем ВСЕГДА, в том числе нулевое.
+
+      Заготовка от PCBObjectFactory приходит с отверстием 30 mil (0,762 мм)
+      -- это значение площадки по умолчанию в самом Altium. Раньше при
+      hl = 0 мы просто не трогали HoleSize, и у каждой SMD-площадки
+      оставалась скрытая неметаллизированная дырка 0,762 мм: в свойствах
+      SMD-площадки поля отверстия нет, и увидеть её можно только через
+      PCB List или Find Similar Objects. На BGA с шагом 0,36 мм DRC сыпал
+      сотнями «Hole size» и «нет пояска» на плате, которая на глаз
+      нормальная. }
+    Pad.HoleSize := hl;
     If hl > 0 Then
     Begin
-        Pad.HoleSize := hl;
         Try
             Pad.Plated := (FldI(line, 11) = 1);
         Except
@@ -521,6 +531,13 @@ Begin
             Except
             End;
     End;
+    If hl <= 0 Then
+        { У площадки без отверстия флаг металлизации ни на что не влияет,
+          но снятая галка рядом с нулевым отверстием сбивает с толку. }
+        Try
+            Pad.Plated := True;
+        Except
+        End;
     Pad.Name := FldS(line, 2);
     Comp.AddPCBObject(Pad);
     GNPad := GNPad + 1;
